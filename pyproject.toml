@@ -85,8 +85,17 @@ dependencies = [
     # OpenAI: We leverage OpenAI Responses, Chat Completions, and Completions schemas for Nemo Gym abstractions. It may also be used to directly query endpoints.
     # We specifically upper bound this OpenAI dependency since the version bumps so frequently.
     # Updated Wed Feb 17, 2026 with openai<=2.7.2
+    # bare-metal: raised to <=2.25.0 (nemo-rl's vllm extra needs openai==2.25.0 for
+    # NamespaceTool in openai.types.responses, added in openai 2.25.0 per bisection
+    # via `uv pip install` — not in any changelog we found). uv's universal lock
+    # resolves this workspace member's deps alongside nemo-rl's own regardless of
+    # which extras are actually selected, so the two ceilings must overlap or the
+    # lock can't resolve at all. Raised to the minimum needed, not the latest, to
+    # stay close to what this pin was actually tested against — if NeMo-Gym's own
+    # openai_utils.py breaks on schema changes between 2.7.2 and 2.25.0, that's a
+    # real regression to investigate, not assume away.
     # License: Apache 2.0 https://github.com/openai/openai-python/blob/a8258744cbecf51321587fc870e8920bd2c07809/LICENSE
-    "openai<=2.7.2",
+    "openai<=2.25.0",
 
     # tqdm: Used for progress tracking on batch operations.
     # Updated Fri Jul 25, 2025 with tqdm==4.67.1
