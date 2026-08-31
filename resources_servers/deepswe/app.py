@@ -245,6 +245,7 @@ class DeepSWEResourcesServer(SimpleResourcesServer):
                 "deepswe-task": current_task_id[:63],
                 "deepswe-phase": phase,
                 "nemo_gym_agent": self.config.name or "deepswe",
+                "nemo.nvidia.com/resources": "custom"
             },
             resources=SandboxResources.from_mapping(resources),
             provider_options=self._provider_options(phase=phase),
