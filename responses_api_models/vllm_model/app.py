@@ -489,6 +489,21 @@ class VLLMConverter(BaseModel):
 
     @classmethod
     def _parse_think_tags(cls, content: str) -> Tuple[List[str], str]:
+        # Some chat templates inject "<think>\n" as a fixed generation-prompt
+        # suffix rather than having the model generate the opening tag itself
+        # (e.g. domynedge_chat_template.jinja's default enable_thinking
+        # branch). A completion that actually reasoned then only ever
+        # contains the closing </think> -- THINK_TAG_PATTERN needs both tags
+        # to match, so without this it never fires and the orphan </think>
+        # (plus the reasoning text before it) leaks straight into the final
+        # answer, which e.g. code_gen's reasoning-format-violation check then
+        # penalizes regardless of answer correctness. Restore the implicit
+        # opening tag before matching. A completion with no closing tag at
+        # all (thinking disabled, or generation cut off mid-think) is
+        # unaffected: the pattern still won't match, and this early-added
+        # "<think>" is discarded along with the rest of `content` in that case.
+        if "<think>" not in content and "</think>" in content:
+            content = "<think>" + content
         # Extract reasoning content from between <think></think> tags.
         matches = cls.THINK_TAG_PATTERN.findall(content)
         # Remove reasoning from main content

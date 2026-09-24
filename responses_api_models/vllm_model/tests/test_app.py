@@ -2653,6 +2653,25 @@ class TestVLLMConverter:
         assert reasoning_none == []
         assert main_content_none == "Just plain content here."
 
+        # Orphan closing tag: some chat templates inject "<think>\n" as a
+        # fixed generation-prompt suffix rather than having the model
+        # generate the opening tag itself, so a real completion only ever
+        # contains the closing </think>. The implicit opening tag should be
+        # restored before matching so the reasoning still gets extracted out
+        # of the final answer.
+        content_orphan = "Reasoning about the problem.</think>Here is the final answer."
+        reasoning_orphan, main_content_orphan = self.converter._extract_reasoning_from_content(content_orphan)
+        assert reasoning_orphan == ["Reasoning about the problem."]
+        assert main_content_orphan == "Here is the final answer."
+
+        # Cut off mid-reasoning (no closing tag either, e.g. hit the length
+        # cap while still inside the think block): must be left untouched,
+        # not have a dangling opening tag reintroduced.
+        content_cutoff = "Still reasoning with no end in sight"
+        reasoning_cutoff, main_content_cutoff = self.converter._extract_reasoning_from_content(content_cutoff)
+        assert reasoning_cutoff == []
+        assert main_content_cutoff == content_cutoff
+
     def test_postprocess_chat_response_multiple_reasoning_items(self, monkeypatch: MonkeyPatch):
         monkeypatch.setattr("responses_api_models.vllm_model.app.uuid4", lambda: FakeUUID())
         monkeypatch.setattr("responses_api_models.vllm_model.app.time", lambda: FIXED_TIME)
