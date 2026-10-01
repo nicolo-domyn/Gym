@@ -114,11 +114,19 @@ def send_email(env: Dict[str, Any], recipient: str, subject: str, body: str) -> 
         "body": body,
         "timestamp": "sent",
     }
-    # Handle both "messages" and "inbox" keys
-    if "inbox" in env:
-        env["inbox"].append(msg)
+    # Handle both "messages" and "inbox" keys, and both list- and dict-shaped collections
+    # (some environments key messages by an id, e.g. candidate_id -- see get_inbox below and
+    # common_tools.py's send_message for the same pattern; this function used to assume list
+    # unconditionally and crashed with AttributeError: 'dict' object has no attribute 'append'
+    # whenever "inbox" was dict-shaped -- confirmed happening in real rollouts).
+    target_key = "inbox" if "inbox" in env else "messages"
+    target = env.get(target_key)
+    if isinstance(target, dict):
+        msg_id = f"MSG-{uuid.uuid4().hex[:6].upper()}"
+        msg["message_id"] = msg_id
+        target[msg_id] = msg
     else:
-        env.setdefault("messages", []).append(msg)
+        env.setdefault(target_key, []).append(msg)
     return f"Email sent to {recipient}."
 
 

@@ -30,6 +30,16 @@ Why NeMo Gym uses aiohttp instead of httpx for async HTTP.
 {bdg-secondary}`server-infra` {bdg-secondary}`performance`
 :::
 
+:::{grid-item-card} {octicon}`note;1.5em;sd-mr-1` Sandbox Container Granularity
+:link: sandbox-container-granularity
+:link-type: doc
+Shared-per-job vs. isolated-per-rollout Singularity sandbox containers, and the call-queue vs.
+live-session-count gap in the throttling proxy — both deliberately deferred, revisit with
+real production telemetry.
++++
+{bdg-secondary}`sandbox` {bdg-secondary}`isolation` {bdg-secondary}`deferred`
+:::
+
 ::::
 
 ```{toctree}
@@ -39,4 +49,5 @@ Why NeMo Gym uses aiohttp instead of httpx for async HTTP.
 Responses API <responses-api-evolution>
 SWE RL Case Study <swe-rl-case-study>
 aiohttp vs httpx <aiohttp-vs-httpx>
+Sandbox Container Granularity <sandbox-container-granularity>
 ```

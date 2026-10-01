@@ -46,6 +46,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ResourcesServerRef
+from nemo_gym.sandbox_launcher import ensure_sandbox
 from nemo_gym.server_utils import SESSION_ID_KEY
 
 
@@ -76,6 +77,14 @@ class NSToolsConfig(BaseResourcesServerConfig):
     # Sandbox configuration for code execution tools
     sandbox_host: str = "127.0.0.1"
     sandbox_port: str = "6000"
+
+    # If set, the sandbox is launched by nemo_gym.sandbox_launcher.ensure_sandbox() inside a
+    # Singularity container (see that module for the isolation rationale) instead of being
+    # assumed to already be running externally. Empty (default) preserves the old behavior --
+    # useful for local dev against a manually-started sandbox. sandbox_host/sandbox_port above
+    # are reused as the launched container's bind address/port.
+    sandbox_sif_path: str = ""
+    sandbox_venv_path: str = ""
 
     # Legacy python_tool HTTP server port (only used for pre-main HTTP PythonTool variants)
     python_tool_port: int = 8765
@@ -141,6 +150,17 @@ class NSToolsResourcesServer(SimpleResourcesServer):
 
         # Initialize nemo_skills ToolManager if tools are configured
         if self.config.nemo_skills_tools:
+            if self.config.sandbox_sif_path:
+                # Isolate the sandbox in a Singularity container before anything tries to
+                # reach it -- see nemo_gym/sandbox_launcher.py for the isolation rationale.
+                # network="none": no legitimate reason for generated code in this sandbox to
+                # reach the network.
+                ensure_sandbox(
+                    sif_path=self.config.sandbox_sif_path,
+                    venv_path=self.config.sandbox_venv_path,
+                    port=int(self.config.sandbox_port),
+                    network="none",
+                )
             self._uses_python_tool_sidecar = any(
                 self._tool_uses_python_tool_sidecar(tool_spec) for tool_spec in self.config.nemo_skills_tools
             )
