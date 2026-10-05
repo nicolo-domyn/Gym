@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import glob as glob_module
 import json
 from asyncio import Future, Semaphore
 from collections import Counter
@@ -28,6 +29,7 @@ from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 from wandb import Table
 
+from nemo_gym import PARENT_DIR
 from nemo_gym.base_resources_server import AggregateMetrics, AggregateMetricsRequest
 from nemo_gym.config_types import BaseNeMoGymCLIConfig, BaseServerConfig
 from nemo_gym.global_config import (
@@ -43,6 +45,7 @@ from nemo_gym.server_utils import (
     ServerClient,
     get_global_config_dict,
     get_response_json,
+    is_global_aiohttp_client_request_debug_enabled,
     is_global_aiohttp_client_setup,
     raise_for_status,
     set_global_aiohttp_client,
@@ -57,6 +60,18 @@ class SharedRolloutCollectionConfig(BaseNeMoGymCLIConfig):
     responses_create_params: Dict[str, Any] = Field(
         default_factory=dict,
         description="Overrides for the responses_create_params e.g. temperature, max_output_tokens, etc.",
+    )
+    upload_rollouts_to_wandb: bool = Field(
+        default=True,
+        description="Upload the rollouts to W&B. Sometimes this should be off because the rollouts are massive. Default: True",
+    )
+    disable_aggregation: bool = Field(
+        default=False,
+        description=(
+            "Skip the post-rollout aggregate-metrics computation and file write. "
+            "Used when sharding rollouts across multiple jobs that will be aggregated together "
+            "afterward by `ng_aggregate_rollouts`."
+        ),
     )
 
 
@@ -110,7 +125,7 @@ class RolloutCollectionConfig(SharedRolloutCollectionConfig):
     )
     num_repeats_add_seed: bool = Field(
         default=False,
-        description='When num_repeats > 1, add a "seed" parameter on the Responses create params.',
+        description='When num_repeats > 1, pass a per-rollout "seed" via metadata.extra_body (honored by vLLM model servers).',
     )
     resume_from_cache: bool = Field(
         default=False,
@@ -127,6 +142,16 @@ class RolloutCollectionConfig(SharedRolloutCollectionConfig):
         return output_fpath.with_stem(output_fpath.stem + "_materialized_inputs").with_suffix(".jsonl")
 
 
+def _rollout_request_debug_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    agent_ref = row.get(AGENT_REF_KEY_NAME) or {}
+    summary = {
+        TASK_INDEX_KEY_NAME: row.get(TASK_INDEX_KEY_NAME),
+        ROLLOUT_INDEX_KEY_NAME: row.get(ROLLOUT_INDEX_KEY_NAME),
+        "agent_name": agent_ref.get("name") if isinstance(agent_ref, dict) else None,
+    }
+    return {k: v for k, v in summary.items() if v is not None}
+
+
 class RolloutCollectionHelper(BaseModel):
     def _preprocess_rows_from_config(self, config: RolloutCollectionConfig) -> List[Dict]:
         range_iterator = repeat(0)
@@ -135,7 +160,9 @@ class RolloutCollectionHelper(BaseModel):
             print(f"Limiting the number of rows to {config.limit}")
 
         if config.num_repeats_add_seed:
-            print("Adding unique `seed` values to each input")
+            print(
+                "Adding unique `seed` values to each input via metadata.extra_body (only honored by vLLM model servers)"
+            )
 
         if config.agent_name:
             print(f"Using `{config.agent_name}` for rows that do not already have an agent ref")
@@ -158,7 +185,11 @@ class RolloutCollectionHelper(BaseModel):
             prompt_cfg = load_prompt_config(config.prompt_config)
             print(f"Using prompt config: {config.prompt_config}")
 
-        with open(config.input_jsonl_fpath) as input_file:
+        _input_path = Path(config.input_jsonl_fpath)
+        if not _input_path.is_absolute():
+            _cwd_path = Path.cwd() / _input_path
+            _input_path = _cwd_path if _cwd_path.exists() else PARENT_DIR / _input_path
+        with open(_input_path) as input_file:
             rows_iterator: Iterator[str] = tqdm(input_file, desc="Reading rows")
             rows_iterator: Iterator[tuple[int, str]] = zip(range_iterator, rows_iterator)
             raw_rows = [(row_idx, row_str, orjson.loads(row_str)) for row_idx, row_str in rows_iterator]
@@ -185,8 +216,12 @@ class RolloutCollectionHelper(BaseModel):
                 row[RESPONSES_CREATE_PARAMS_KEY_NAME] | responses_create_params_overrides
             )
 
-            # Resolve task index
-            row[TASK_INDEX_KEY_NAME] = row_to_task_idx.setdefault(row_str, len(row_to_task_idx))
+            # Resolve task index. Honor a caller-provided value when present (e.g. when an
+            # upstream slicer has stamped a globally-stable index across chunks so that
+            # subsequent /aggregate_metrics groupby unions chunks correctly); otherwise dedupe
+            # identical input rows to the same task index as before.
+            if TASK_INDEX_KEY_NAME not in row:
+                row[TASK_INDEX_KEY_NAME] = row_to_task_idx.setdefault(row_str, len(row_to_task_idx))
 
             for _ in range(num_repeats):
                 row = deepcopy(row)
@@ -196,7 +231,10 @@ class RolloutCollectionHelper(BaseModel):
                 task_idx_to_rollout_idx[row[TASK_INDEX_KEY_NAME]] += 1
 
                 if config.num_repeats_add_seed:
-                    row[RESPONSES_CREATE_PARAMS_KEY_NAME]["seed"] = row[ROLLOUT_INDEX_KEY_NAME]
+                    metadata = row[RESPONSES_CREATE_PARAMS_KEY_NAME].setdefault("metadata", {})
+                    extra_body = json.loads(metadata.get("extra_body", "{}"))
+                    extra_body["seed"] = row[ROLLOUT_INDEX_KEY_NAME]
+                    metadata["extra_body"] = json.dumps(extra_body)
 
                 rows.append(row)
 
@@ -302,11 +340,12 @@ class RolloutCollectionHelper(BaseModel):
                 top_left = counts_left.most_common(5)  # Fix to top 3 for now.
                 if top_left:
                     top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
-                    print(f"Examples left:\n{top_left_str}")
+                    # Use tqdm.write here so we can print properly with tqdm being used.
+                    tqdm.write(f"Examples left:\n{top_left_str}")
 
         results_file.close()
 
-        if get_wandb_run():  # pragma: no cover
+        if config.upload_rollouts_to_wandb and get_wandb_run():  # pragma: no cover
             print("Uploading rollouts to W&B. This may take a few minutes if your data is large.")
             get_wandb_run().log({"Rollouts": Table(data=result_strs, columns=["Rollout"])})
         del result_strs
@@ -316,8 +355,15 @@ class RolloutCollectionHelper(BaseModel):
         results.sort(key=lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]))
 
         # Compute and write aggregate metrics via /aggregate_metrics on each agent server
-        print("Computing aggregate metrics")
-        aggregate_metrics_fpath = await self._call_aggregate_metrics(results, rows, output_fpath)
+        if config.disable_aggregation:
+            print(
+                "Skipping aggregate-metrics computation because disable_aggregation=True. "
+                "Run `ng_aggregate_rollouts` after all shards finish to compute the global metrics."
+            )
+            aggregate_metrics_fpath = None
+        else:
+            print("Computing aggregate metrics")
+            aggregate_metrics_fpath = await self._call_aggregate_metrics(results, rows, output_fpath)
 
         print(f"""Finished rollout collection! View results at:
 Fully materialized inputs: {config.materialized_jsonl_fpath}
@@ -430,7 +476,17 @@ Aggregate metrics: {aggregate_metrics_fpath}""")
         async def _post_subroutine(row: Dict) -> Tuple[Dict, Dict]:
             async with semaphore:
                 res = await server_client.post(server_name=row["agent_ref"]["name"], url_path="/run", json=row)
-                await raise_for_status(res)
+                try:
+                    await raise_for_status(res)
+                except Exception:
+                    if is_global_aiohttp_client_request_debug_enabled():
+                        print(
+                            "[rollout_collection] /run failed "
+                            f"status={getattr(res, 'status', None)} "
+                            f"row={json.dumps(_rollout_request_debug_summary(row), sort_keys=True)}",
+                            flush=True,
+                        )
+                    raise
                 return row, await get_response_json(res)
 
         return tqdm.as_completed(
@@ -460,3 +516,107 @@ def collect_rollouts():  # pragma: no cover
     rch = RolloutCollectionHelper()
 
     asyncio.run(rch.run_from_config(config))
+
+
+class RolloutAggregationConfig(BaseNeMoGymCLIConfig):
+    """
+    Aggregate metrics across rollout shards produced by `ng_collect_rollouts +disable_aggregation=true`.
+
+    Reads every JSONL file matching `input_glob`, computes aggregate metrics by POSTing to each
+    agent server's `/aggregate_metrics` endpoint over the global union of records, and writes a
+    single `<output_jsonl_fpath stem>_aggregate_metrics.json` next to the rollouts. By default
+    also concatenates all shards into `output_jsonl_fpath`.
+
+    Examples:
+
+    ```bash
+    ng_aggregate_rollouts \
+        "+config_paths=[benchmarks/aime24/config.yaml,responses_api_models/vllm_model/configs/vllm_model.yaml]" \
+        +input_glob='results/rollouts-rs*-chunk*.jsonl' \
+        +output_jsonl_fpath=results/rollouts.jsonl
+    ```
+    """
+
+    input_glob: str = Field(
+        description=(
+            "Glob pattern or comma-separated list of glob patterns matching the rollout shards "
+            "to aggregate (e.g. 'results/rollouts-rs*-chunk*.jsonl' or "
+            "'results/run1/rollouts.jsonl,results/run2/rollouts.jsonl'). Whitespace around "
+            "commas is stripped. Duplicate matches across patterns are deduplicated."
+        )
+    )
+    output_jsonl_fpath: str = Field(
+        description=(
+            "Path used to derive the aggregate-metrics output location "
+            "('<stem>_aggregate_metrics.json' next to this path) and, when merge_shards=True, "
+            "the merged-rollouts file."
+        ),
+    )
+    merge_shards: bool = Field(
+        default=True,
+        description="Concatenate the matched shard JSONLs into output_jsonl_fpath alongside the metrics file.",
+    )
+
+
+def _expand_input_glob(input_glob: str) -> List[str]:
+    """Expand a glob-or-comma-separated-globs string into a sorted, deduplicated list of paths.
+
+    Examples:
+      'results/rollouts.jsonl' -> ['results/rollouts.jsonl'] (if it exists)
+      'a/*.jsonl, b/*.jsonl'   -> matches of both patterns, deduplicated
+    """
+    patterns = [p.strip() for p in input_glob.split(",") if p.strip()]
+    seen: Dict[str, None] = {}  # preserve insertion order while deduping
+    for pattern in patterns:
+        for path in sorted(glob_module.glob(pattern)):
+            seen.setdefault(path, None)
+    return list(seen)
+
+
+class RolloutAggregationHelper(BaseModel):
+    async def run_from_config(self, config: RolloutAggregationConfig) -> Optional[Path]:
+        input_paths = _expand_input_glob(config.input_glob)
+        if not input_paths:
+            raise FileNotFoundError(f"No shards matched input_glob={config.input_glob!r}")
+        print(f"Aggregating {len(input_paths)} shard(s):")
+        for p in input_paths:
+            print(f"  - {p}")
+
+        results: List[Dict] = []
+        for shard_path in input_paths:
+            with open(shard_path, "rb") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    results.append(orjson.loads(line))
+        print(f"Loaded {len(results)} rollout record(s) from {len(input_paths)} shard(s)")
+
+        # Sort for deterministic aggregation ordering (matches run_from_config's post-collection sort)
+        results.sort(key=lambda r: (r.get(TASK_INDEX_KEY_NAME), r.get(ROLLOUT_INDEX_KEY_NAME)))
+
+        output_fpath = Path(config.output_jsonl_fpath)
+        output_fpath.parent.mkdir(parents=True, exist_ok=True)
+
+        if config.merge_shards:
+            print(f"Merging shards into {output_fpath}")
+            with output_fpath.open("wb") as out:
+                for r in results:
+                    out.write(orjson.dumps(r) + b"\n")
+
+        # `_call_aggregate_metrics` only inspects each row's AGENT_REF_KEY_NAME, which results already carry.
+        helper = RolloutCollectionHelper()
+        aggregate_metrics_fpath = await helper._call_aggregate_metrics(results, results, output_fpath)
+
+        print(f"""Finished rollout aggregation! View results at:
+Merged rollouts: {output_fpath if config.merge_shards else "<not merged>"}
+Aggregate metrics: {aggregate_metrics_fpath}""")
+
+        return aggregate_metrics_fpath
+
+
+def aggregate_rollouts():  # pragma: no cover
+    config = RolloutAggregationConfig.model_validate(get_global_config_dict())
+    rah = RolloutAggregationHelper()
+
+    asyncio.run(rah.run_from_config(config))

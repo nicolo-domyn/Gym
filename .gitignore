@@ -237,3 +237,9 @@ env.yaml
 
 # Backup files
 *.backup
+
+# brave_search's undici install (for proxy-hook.cjs) -- installed by
+# scripts/presync_baremetal_extras.sbatch in the outer domyn-rl repo
+resources_servers/brave_search/node_modules
+resources_servers/brave_search/package.json
+resources_servers/brave_search/package-lock.json

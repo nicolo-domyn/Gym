@@ -1,2 +1,10 @@
 -e nemo-gym[dev] @ ../../
-nemo-skills @ git+https://github.com/NVIDIA-NeMo/Skills.git@georgea/super-rl-02062026
+## NeMo-Skills tools subpackage as of April 8, 2026
+nemo-skills-tools @ git+https://github.com/NVIDIA-NeMo/Skills.git@0596dd20cf9ce338a9a4f1e0010fd67ceb1bb4e6#subdirectory=tools
+## nemo-skills-tools' own METADATA declares `Requires-Dist: mcp` with no version
+## constraint. Its pinned commit (April 2026) still imports the MCP SDK's old
+## `streamablehttp_client` name (mcp.client.streamable_http), which was dropped
+## in the mcp 2.0.0 major rewrite (July 2026) in favor of `streamable_http_client`.
+## Pin below the 2.x break so the unlocked `uv pip install -r requirements.txt`
+## resolution doesn't silently pick up an incompatible newer mcp release.
+mcp<2.0.0

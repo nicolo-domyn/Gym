@@ -1,0 +1,56 @@
+brave_search:
+  resources_servers:
+    brave_search:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: Multi-choice question answering problems with Brave Search MCP tools integrated
+      value: Improve knowledge-related benchmarks with search tools
+      # oc.env (not the usual ${brave_api_key}/env.yaml Gym convention): this repo's
+      # secrets all flow through one gitignored .env at the repo root (see
+      # .env.example), sourced by launch.sh and exported into the job's env —
+      # matches ns_tools's own oc.env precedent for sandbox_host/port elsewhere in
+      # this same Gym fork.
+      brave_api_key: ${oc.env:BRAVE_API_KEY}
+      # See resources_servers/brave_search/README.md "Outbound internet access" for why this
+      # is needed on boost_usr_prod and how to point it at a gateway once one exists.
+      brave_mcp_base_url: ${oc.env:BRAVE_MCP_BASE_URL,null}
+      # Distributed rate limiter for Brave's own API rate limit (30 requests/second, see
+      # rate_limiter.py). redis_host is discovered at training-driver startup by
+      # nemo_rl/utils/redis_job.py (enabled via that training config's `redis:` block) and
+      # exported as NEMO_RL_REDIS_HOST; redis_password is the shared, static password baked
+      # into images/redis/redis.conf, not a per-run secret -- source it from your own .env
+      # (see .env.example). Requires a training config with redis.enabled: true, or every
+      # request will fail fast at startup (redis_host stays null).
+      rate_limiter_enabled: true
+      redis_host: ${oc.env:NEMO_RL_REDIS_HOST,null}
+      redis_port: 6380
+      redis_password: ${oc.env:REDIS_PASSWORD,null}
+      rate_limit_window_sec: 1
+      rate_limit_count: 30 # Brave Search API: 30 requests/second
+      rate_limit_max_wait_sec: 10
+brave_search_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: brave_search
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: resources_servers/brave_search/data/train.jsonl
+        gitlab_identifier:
+          dataset_name: search_STEM_syn_gpqa_v1_2_difficulty_filtered
+          version: 0.0.1
+          artifact_fpath: MCQA_syn_gpqa_1_2_difficulty_filtered_responses_api.jsonl
+        huggingface_identifier:
+          repo_id: nvidia/Nemotron-RL-knowledge-web_search-mcqa
+          artifact_fpath: mcqa_search.jsonl
+        license: Apache 2.0
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/brave_search/data/example.jsonl
