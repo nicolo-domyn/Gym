@@ -26,23 +26,11 @@ import ray
 from fastapi import Body, FastAPI
 from pydantic import BaseModel, ConfigDict
 
-from nemo_gym.base_resources_server import (
-    BaseRunRequest,
-    BaseVerifyResponse,
-)
-from nemo_gym.base_responses_api_agent import (
-    BaseResponsesAPIAgentConfig,
-    SimpleResponsesAPIAgent,
-)
+from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
+from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
 from nemo_gym.config_types import ModelServerRef
-from nemo_gym.global_config import (
-    get_first_server_config_dict,
-    get_global_config_dict,
-)
-from nemo_gym.openai_utils import (
-    NeMoGymResponse,
-    NeMoGymResponseCreateParamsNonStreaming,
-)
+from nemo_gym.global_config import get_first_server_config_dict, get_global_config_dict
+from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
 
@@ -102,6 +90,13 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # --- Job output ---
     # Directory where Harbor writes job results and trial artifacts.
     harbor_jobs_dir: str = "jobs"
+    # [CUSTOM] Base directory for this agent's own per-rollout result dumps (see
+    # _get_results_output_dir below) -- None preserves the original Path.cwd()-relative
+    # behavior. Set both this and harbor_jobs_dir to absolute paths in our own 
+    # harbor_agent.yaml so future runs keep real, inspectable per-rollout verifier 
+    # output (reward, verifier_result, full trajectory) instead of only ever seeing the
+    # aggregate reward number.
+    harbor_results_dir: Optional[str] = None
 
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
@@ -327,7 +322,12 @@ class HarborAgent(SimpleResponsesAPIAgent):
         date_key = run_timestamp.strftime("%Y%m%d")
         dataset_key = self._sanitize_path_component(dataset_alias)
         model_key = self._sanitize_path_component(self._extract_model_name(policy_model_name))
-        return Path.cwd() / "results" / "runs" / date_key / dataset_key / model_key
+        # [CUSTOM] See harbor_results_dir's own comment -- Path.cwd() alone (the original,
+        # still-default behavior when harbor_results_dir is unset) resolves to wherever this
+        # actor's Ray worker process happens to have started, which is not reliably shared
+        # storage.
+        base = Path(self.config.harbor_results_dir) if self.config.harbor_results_dir else Path.cwd() / "results"
+        return base / "runs" / date_key / dataset_key / model_key
 
     def _get_jobs_output_dir(self, policy_model_name: str, dataset_alias: str, run_timestamp: datetime) -> Path:
         """Build Harbor jobs directory grouped by date/dataset/model."""
@@ -392,18 +392,9 @@ class HarborAgent(SimpleResponsesAPIAgent):
         responses_create_params: Optional[dict[str, Any]] = None,
     ) -> dict:
         """Build a Harbor JobConfig dict for a single task."""
-        from harbor.models.job.config import (
-            JobConfig,
-            LocalDatasetConfig,
-            OrchestratorConfig,
-            RegistryDatasetConfig,
-        )
+        from harbor.models.job.config import JobConfig, LocalDatasetConfig, OrchestratorConfig, RegistryDatasetConfig
         from harbor.models.registry import RemoteRegistryInfo
-        from harbor.models.trial.config import (
-            AgentConfig,
-            EnvironmentConfig,
-            VerifierConfig,
-        )
+        from harbor.models.trial.config import AgentConfig, EnvironmentConfig, VerifierConfig
 
         agent_kwargs: dict[str, Any] = {"api_base": api_base}
         if responses_create_params:

@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -72,6 +74,13 @@ class Terminus2NemoGym(Terminus2):
                 model_info=model_info,
                 responses_create_params=responses_create_params,
                 timeout_sec=nemo_model_server_timeout_sec,
+                # [CUSTOM] trial.py's AgentFactory.create_agent_from_config
+                # passes the real per-trial logger (job.log FileHandler, DEBUG level)
+                # as a `logger` kwarg, which lands in **kwargs here since this __init__
+                # doesn't declare it explicitly. super().__init__() below still forwards
+                # it on unchanged (normal self.logger wiring) -- reading it early too just
+                # lets NemoGymLLM's own diagnostic logging land in the same job.log.
+                logger=kwargs.get("logger"),
             )
 
         super().__init__(
@@ -110,14 +119,39 @@ class Terminus2NemoGym(Terminus2):
         entire rollout batch.
         """
         self._memory_limit_exceeded = False
+        run_start = time.monotonic()
         try:
             await super().run(instruction, environment, context)
         except MemoryLimitExceededError as e:
             self._memory_limit_exceeded = True
             self.logger.info(f"Agent error: {type(e).__name__}: {e}. Returning history from completed turns.")
+        except asyncio.CancelledError:
+            # [CUSTOM] Log the live counters here, at the exact moment of cancellation. 
+            # Must re-raise not to break asyncio's cancellation contract.
+            elapsed = time.monotonic() - run_start
+            self.logger.info(
+                f"[terminus_2_nemo_gym] Agent cancelled after {elapsed:.1f}s wall-clock, "
+                f"n_episodes={self._n_episodes}, n_llm_calls={len(self._api_request_times)}, "
+                f"last_call_durations_msec={self._api_request_times[-3:]}"
+            )
+            raise
         except Exception as e:
             self.logger.info(f"Agent error: {type(e).__name__}: {e}. Returning history from completed turns.")
         finally:
+            # [CUSTOM] Work around laude-institute/harbor bug, fixed upstream in PR #686
+            # (laude-institute/harbor@8c040e1b, 2026-02-13) but absent from our pinned
+            # commit (9dddd797b, 2026-01-27 -- 43 commits before the fix).
+            #
+            # The bug: Terminus2.run()'s own finally block reports n_episodes from a local
+            # `actual_episodes` var that only gets assigned if _run_agent_loop() returns
+            # normally. On ANY exception out of the loop -- including the
+            # AgentTimeoutError/CancelledError case above -- it silently stays at its
+            # pre-loop default of 0, even if many episodes actually completed.
+            # self._n_episodes is updated live inside the loop
+            # (`self._n_episodes = episode + 1` after each turn) and is always correct;
+            # overwriting with it here is a no-op in the non-buggy case.
+            if context.metadata is not None:
+                context.metadata["n_episodes"] = self._n_episodes
             self._write_agent_error_flags()
 
     def _write_agent_error_flags(self) -> None:
