@@ -14,6 +14,8 @@
 # limitations under the License.
 import asyncio
 import multiprocessing
+import queue
+import threading
 from typing import List, Literal, Optional
 
 from fastapi import FastAPI
@@ -27,11 +29,12 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 
-# [CUSTOM]
+
+# [CUSTOM]
 # check_following() is plain CPU-bound Python (regexes, nltk), and some checks are
 # quadratic in the response length: on a degenerate ~100k-token response a single call
 # runs for >1h, blocking this server's event loop and wedging every pending rollout.
-# Each verify therefore runs its checks in a child process that is killed on timeout.
+# Each verify therefore runs its checks in a worker process that is killed on timeout.
 CHECK_TIMEOUT_S = 60.0
 MAX_CONCURRENT_CHECKS = 16
 
@@ -101,49 +104,114 @@ def _check_instructions(instruction_list: List, kwargs_list: List, final_respons
 
 
 def _check_instructions_child(conn, *args) -> None:
+    # One-shot child of the previous version (a fresh process per check). Kept so servers
+    # started before this version, whose children import this file from disk, keep working.
     conn.send(_check_instructions(*args))
     conn.close()
 
 
-_mp_context = None
+def _checker_worker(conn) -> None:
+    conn.send("ready")
+    while True:
+        try:
+            args = conn.recv()
+        except EOFError:  # the server closed the pipe
+            return
+        conn.send(_check_instructions(*args))
 
 
-def _get_mp_context():
-    # forkserver, not fork: this process runs uvicorn plus several threads. Preload this
-    # module so each child forks with it (and verifiable_instructions) already imported
-    # instead of re-importing nemo_gym per check.
-    global _mp_context
-    if _mp_context is None:
-        _mp_context = multiprocessing.get_context("forkserver")
-        _mp_context.set_forkserver_preload(["__main__" if __name__ == "__main__" else __name__])
-    return _mp_context
+class _CheckerPool:
+    """Persistent checker processes, each running one check at a time.
 
+    A fresh process per check re-imported this module (and nemo_gym) every time, ~6s of CPU:
+    set_forkserver_preload(["__main__"]) does nothing on CPython 3.13, whose forkserver looks
+    up a "main_path" key that get_preparation_data never sets. It also made every check load
+    this file from disk mid-run, so a check that read it while it was being rewritten (job
+    61445978) found no _check_instructions_child and scored every instruction as failed.
+    Workers import once and are reused; one is replaced only after a timeout or a crash.
+    """
 
-def _check_instructions_with_timeout(
-    instruction_list: List, kwargs_list: List, final_response_text: str, timeout_s: float
-) -> Optional[List[bool]]:
-    """Returns None if the checks did not finish within timeout_s."""
-    ctx = _get_mp_context()
-    recv_conn, send_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(
-        target=_check_instructions_child,
-        args=(send_conn, instruction_list, kwargs_list, final_response_text),
-        daemon=True,
-    )
-    proc.start()
-    send_conn.close()
-    try:
-        if recv_conn.poll(timeout_s):
+    STARTUP_TIMEOUT_S = 600.0
+
+    def __init__(self, size: int):
+        self._size = size
+        self._idle: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._live = 0
+
+    def _spawn(self):
+        # forkserver, not fork: this process runs uvicorn plus several threads.
+        ctx = multiprocessing.get_context("forkserver")
+        conn, child_conn = ctx.Pipe()
+        proc = ctx.Process(target=_checker_worker, args=(child_conn,), daemon=True)
+        proc.start()
+        child_conn.close()
+        if not conn.poll(self.STARTUP_TIMEOUT_S) or conn.recv() != "ready":
+            raise RuntimeError(f"Instruction checker did not start within {self.STARTUP_TIMEOUT_S}s")
+        return proc, conn
+
+    def _acquire(self, fresh: bool = False):
+        while not fresh:
             try:
-                return recv_conn.recv()
-            except EOFError:  # child died without sending
-                return [False] * len(instruction_list)
-        return None
-    finally:
-        recv_conn.close()
+                worker = self._idle.get_nowait()
+            except queue.Empty:
+                break
+            if worker[0].is_alive():
+                return worker
+            self._discard(worker)
+        with self._lock:
+            # A retry after a crash goes one over the size rather than wait for a worker.
+            grow = fresh or self._live < self._size
+            if grow:
+                self._live += 1
+        if not grow:
+            return self._idle.get()
+        try:
+            return self._spawn()
+        except BaseException:
+            with self._lock:
+                self._live -= 1
+            raise
+
+    def _discard(self, worker) -> None:
+        proc, conn = worker
+        conn.close()
         if proc.is_alive():
             proc.kill()
         proc.join()
+        with self._lock:
+            self._live -= 1
+
+    def check(
+        self, instruction_list: List, kwargs_list: List, final_response_text: str, timeout_s: float
+    ) -> Optional[List[bool]]:
+        """Returns None if the checks did not finish within timeout_s.
+
+        A worker that dies mid-check is retried once on a fresh one before the instructions
+        are scored as failed, so a lost process is not silently a zero reward.
+        """
+        for attempt in range(2):
+            worker = self._acquire(fresh=attempt > 0)
+            _, conn = worker
+            try:
+                conn.send((instruction_list, kwargs_list, final_response_text))
+                if not conn.poll(timeout_s):
+                    self._discard(worker)
+                    return None
+                result = conn.recv()
+            except (EOFError, OSError) as e:  # the worker died (BrokenPipeError is an OSError)
+                self._discard(worker)
+                print(f"Instruction checker died ({e!r}), attempt {attempt + 1} of 2")
+                continue
+            except BaseException:
+                self._discard(worker)
+                raise
+            self._idle.put(worker)
+            return result
+        return [False] * len(instruction_list)
+
+
+_CHECKERS = _CheckerPool(MAX_CONCURRENT_CHECKS)
 
 
 class InstructionFollowingResourcesServer(SimpleResourcesServer):
@@ -193,7 +261,7 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
         kwargs_list = body.kwargs
         async with self._check_slots:
             is_following_list = await asyncio.to_thread(
-                _check_instructions_with_timeout,
+                _CHECKERS.check,
                 instruction_list,
                 kwargs_list,
                 final_response_text,
