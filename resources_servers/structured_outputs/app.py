@@ -315,6 +315,19 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
 
         schema_type = schema["type"]
 
+        # Nullable/union types, e.g. ["integer", "null"]: an empty tag is null when
+        # allowed, otherwise use the first type the value coerces to (as for CSV).
+        if isinstance(schema_type, list):
+            if data is None and "null" in schema_type:
+                return None
+            for t in schema_type:
+                if t == "null":
+                    continue
+                result = self.coerce_xml_types(data, {**schema, "type": t})
+                if result is not data or t == "string":
+                    return result
+            return data
+
         if schema_type == "object" and isinstance(data, dict):
             properties = schema.get("properties", {})
             coerced = {}
@@ -363,25 +376,29 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
 
         return data
 
-    def coerce_csv_types(self, rows: List[Dict[str, str]], schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def coerce_csv_types(self, rows: Any, schema: Dict[str, Any]) -> Any:
         """Coerce CSV string values to match JSON Schema types.
 
         csv.DictReader returns all values as strings.  Walk rows alongside the
         items schema and convert values where possible.  On conversion failure
         the original string is kept so that schema validation reports the error.
+        `rows` is a list of rows for an array schema, or a single row (dict) for an
+        object schema.
         """
+        if isinstance(rows, dict):
+            return self._coerce_csv_row(rows, schema.get("properties", {}))
+
         items_schema = schema.get("items", schema)
         properties = items_schema.get("properties", {})
+        return [self._coerce_csv_row(row, properties) for row in rows]
 
-        coerced_rows = []
-        for row in rows:
-            coerced: Dict[str, Any] = {}
-            for key, value in row.items():
-                prop_schema = properties.get(key, {})
-                prop_type = prop_schema.get("type", "string")
-                coerced[key] = self._coerce_csv_scalar(value, prop_type)
-            coerced_rows.append(coerced)
-        return coerced_rows
+    def _coerce_csv_row(self, row: Dict[str, str], properties: Dict[str, Any]) -> Dict[str, Any]:
+        coerced: Dict[str, Any] = {}
+        for key, value in row.items():
+            prop_schema = properties.get(key, {})
+            prop_type = prop_schema.get("type", "string")
+            coerced[key] = self._coerce_csv_scalar(value, prop_type)
+        return coerced
 
     def _coerce_csv_scalar(self, value: str, target_type) -> Any:
         """Coerce a single CSV string to the target JSON Schema type."""
@@ -410,6 +427,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
                     return True
                 if lower in ("false", "0"):
                     return False
+            # CSV cells are flat, so nested arrays/objects can only be written as JSON.
+            if target_type in ("array", "object"):
+                decoded = json.loads(value)
+                if isinstance(decoded, list if target_type == "array" else dict):
+                    return decoded
         except (ValueError, AttributeError):
             pass
         return value
@@ -450,15 +472,47 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         except Exception as e:
             return 0.0, "parse_error", f"{type(e).__name__}: {str(e)[:200]}"
 
-        try:
-            if schema_type == SchemaType.XML and self.config.xml_coerce_types:
-                response_obj = self.coerce_xml_types(response_obj, schema)
-            if schema_type == SchemaType.CSV:
-                response_obj = self.coerce_csv_types(response_obj, schema)
-            validate_against_schema_openapi(response_obj, schema)
-            return 1.0, None, None
-        except Exception as e:
-            return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
+        candidates = self.candidate_objects(schema_type, response_obj, schema)
+        if not candidates:
+            return 0.0, "validation_error", "CSV for an object schema must have exactly one data row"
+
+        # Report the last reading's error: it is the most lenient one tried.
+        error = None
+        for candidate in candidates:
+            try:
+                if schema_type == SchemaType.XML and self.config.xml_coerce_types:
+                    candidate = self.coerce_xml_types(candidate, schema)
+                if schema_type == SchemaType.CSV:
+                    candidate = self.coerce_csv_types(candidate, schema)
+                validate_against_schema_openapi(candidate, schema)
+                return 1.0, None, None
+            except Exception as e:
+                error = f"{type(e).__name__}: {str(e)[:200]}"
+        return 0.0, "validation_error", error
+
+    def candidate_objects(self, schema_type: SchemaType, response_obj: Any, schema: Dict[str, Any]) -> List[Any]:
+        """Readings of a parsed document to validate, in order; any one passing is a pass.
+
+        Some formats cannot express every schema's top level as-is:
+        - XML always has exactly one root element, which xmltodict keeps as a
+          wrapping key ({"person": {...}}). Try the document as-is first (the schema
+          may name the root), then with the root unwrapped.
+        - TOML's top level is always a table, so an array schema can only be
+          written as a single key holding the array (e.g. [[items]]).
+        - CSV is a list of rows; an object schema is written as a single data row.
+        """
+        top_type = schema.get("type")
+        single_value = (
+            next(iter(response_obj.values())) if isinstance(response_obj, dict) and len(response_obj) == 1 else None
+        )
+
+        if schema_type == SchemaType.XML and single_value is not None:
+            return [response_obj, single_value]
+        if schema_type == SchemaType.TOML and top_type == "array" and isinstance(single_value, list):
+            return [single_value]
+        if schema_type == SchemaType.CSV and top_type == "object":
+            return [response_obj[0]] if len(response_obj) == 1 else []
+        return [response_obj]
 
 
 if __name__ == "__main__":

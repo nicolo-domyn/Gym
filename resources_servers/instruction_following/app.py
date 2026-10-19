@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Literal
+import asyncio
+import multiprocessing
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI
 from verifiable_instructions import instructions_registry
@@ -24,6 +26,14 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+
+# [CUSTOM]
+# check_following() is plain CPU-bound Python (regexes, nltk), and some checks are
+# quadratic in the response length: on a degenerate ~100k-token response a single call
+# runs for >1h, blocking this server's event loop and wedging every pending rollout.
+# Each verify therefore runs its checks in a child process that is killed on timeout.
+CHECK_TIMEOUT_S = 60.0
+MAX_CONCURRENT_CHECKS = 16
 
 
 class InstructionFollowingResourcesServerConfig(BaseResourcesServerConfig):
@@ -57,12 +67,92 @@ class InstructionFollowingVerifyResponse(BaseVerifyResponse):
     ] = "binary"
 
 
+def _check_instructions(instruction_list: List, kwargs_list: List, final_response_text: str) -> List[bool]:
+    is_following_list = []
+
+    for instruction_id, kwargs in zip(instruction_list, kwargs_list):
+        try:
+            # Create instruction instance
+            instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+            instruction = instruction_cls(instruction_id)
+
+            # Handle None kwargs
+            if kwargs is None:
+                kwargs = {}
+
+            # Filter out None values from kwargs
+            filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+            # Build the instruction description with the provided kwargs
+            instruction.build_description(**filtered_kwargs)
+
+            # Check if the response follows the instruction
+            if instruction.check_following(final_response_text):
+                is_following_list.append(True)
+            else:
+                is_following_list.append(False)
+
+        except Exception as e:
+            # If there's an error processing the instruction, mark as failed
+            print(f"Error processing instruction {instruction_id}: {e}")
+            is_following_list.append(False)
+
+    return is_following_list
+
+
+def _check_instructions_child(conn, *args) -> None:
+    conn.send(_check_instructions(*args))
+    conn.close()
+
+
+_mp_context = None
+
+
+def _get_mp_context():
+    # forkserver, not fork: this process runs uvicorn plus several threads. Preload this
+    # module so each child forks with it (and verifiable_instructions) already imported
+    # instead of re-importing nemo_gym per check.
+    global _mp_context
+    if _mp_context is None:
+        _mp_context = multiprocessing.get_context("forkserver")
+        _mp_context.set_forkserver_preload(["__main__" if __name__ == "__main__" else __name__])
+    return _mp_context
+
+
+def _check_instructions_with_timeout(
+    instruction_list: List, kwargs_list: List, final_response_text: str, timeout_s: float
+) -> Optional[List[bool]]:
+    """Returns None if the checks did not finish within timeout_s."""
+    ctx = _get_mp_context()
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_check_instructions_child,
+        args=(send_conn, instruction_list, kwargs_list, final_response_text),
+        daemon=True,
+    )
+    proc.start()
+    send_conn.close()
+    try:
+        if recv_conn.poll(timeout_s):
+            try:
+                return recv_conn.recv()
+            except EOFError:  # child died without sending
+                return [False] * len(instruction_list)
+        return None
+    finally:
+        recv_conn.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join()
+
+
 class InstructionFollowingResourcesServer(SimpleResourcesServer):
     config: InstructionFollowingResourcesServerConfig
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._ensure_nltk_data()
+        self._check_slots = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
     def _ensure_nltk_data(self):
         """Ensure required NLTK data is available at startup.
@@ -101,34 +191,21 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
         # Verify each instruction using the verifiable instructions
         instruction_list = body.instruction_id_list
         kwargs_list = body.kwargs
-        is_following_list = []
-
-        for instruction_id, kwargs in zip(instruction_list, kwargs_list):
-            try:
-                # Create instruction instance
-                instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
-                instruction = instruction_cls(instruction_id)
-
-                # Handle None kwargs
-                if kwargs is None:
-                    kwargs = {}
-
-                # Filter out None values from kwargs
-                filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-                # Build the instruction description with the provided kwargs
-                instruction.build_description(**filtered_kwargs)
-
-                # Check if the response follows the instruction
-                if instruction.check_following(final_response_text):
-                    is_following_list.append(True)
-                else:
-                    is_following_list.append(False)
-
-            except Exception as e:
-                # If there's an error processing the instruction, mark as failed
-                print(f"Error processing instruction {instruction_id}: {e}")
-                is_following_list.append(False)
+        async with self._check_slots:
+            is_following_list = await asyncio.to_thread(
+                _check_instructions_with_timeout,
+                instruction_list,
+                kwargs_list,
+                final_response_text,
+                CHECK_TIMEOUT_S,
+            )
+        if is_following_list is None:
+            print(
+                f"Instruction checks timed out after {CHECK_TIMEOUT_S}s (id={body.id}, "
+                f"instructions={instruction_list}, response_chars={len(final_response_text)}); "
+                "marking all as not followed"
+            )
+            is_following_list = [False] * len(instruction_list)
 
         # Calculate overall success
         reward_mode = getattr(body, "grading_mode", "binary")
