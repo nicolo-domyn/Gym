@@ -1082,3 +1082,52 @@ class TestApp:
 
         nullable_verify_response = await resources_server.verify(nullable_request)
         assert nullable_verify_response.reward == 1.0
+
+    async def test_formats_that_cannot_express_the_schema_top_level(
+        self, config: StructuredOutputsResourcesServerConfig
+    ) -> None:
+        resources_server = StructuredOutputsResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+        def score(schema_type: SchemaType, schema: dict, text: str) -> float:
+            return resources_server.evaluate_structured_output_response(schema_type, json.dumps(schema), text)[0]
+
+        person = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+        }
+        cities = {"type": "array", "items": {"type": "object", "properties": {"city": {"type": "string"}}}}
+        glossary = {
+            "type": "object",
+            "properties": {
+                "term": {"type": "string"},
+                "entries": {"type": "array", "items": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            },
+        }
+
+        # XML: the mandatory root element is unwrapped, whatever its name.
+        assert score(SchemaType.XML, person, "<person><name>Ann</name><age>3</age></person>") == 1.0
+        assert score(SchemaType.XML, person, "<person><name>Ann</name><age>x</age></person>") == 0.0
+        assert score(SchemaType.XML, person, "<person><name>Ann</name><age>3</age><extra>1</extra></person>") == 0.0
+        assert score(SchemaType.XML, cities, "<rows><row><city>A</city></row><row><city>B</city></row></rows>") == 1.0
+        nullable = {
+            "type": "object",
+            "properties": {"year": {"type": ["integer", "null"]}, "rating": {"type": ["number", "null"]}},
+        }
+        assert score(SchemaType.XML, nullable, "<film><year>1977</year><rating>4.6</rating></film>") == 1.0
+        assert score(SchemaType.XML, nullable, "<film><year/><rating>4.6</rating></film>") == 1.0
+        assert score(SchemaType.XML, nullable, "<film><year>soon</year><rating>4.6</rating></film>") == 0.0
+        # Several top-level elements are not a well-formed XML document.
+        assert score(SchemaType.XML, person, "<name>Ann</name>\n<age>3</age>") == 0.0
+
+        # TOML: an array schema is written as a single key holding the array.
+        assert score(SchemaType.TOML, cities, '[[cities]]\ncity = "A"\n\n[[cities]]\ncity = "B"\n') == 1.0
+        assert score(SchemaType.TOML, cities, '[[cities]]\ncity = "A"\n\n[[other]]\ncity = "B"\n') == 0.0
+        # ...but an object schema still needs its keys at the top level.
+        assert score(SchemaType.TOML, person, '[person]\nname = "Ann"\nage = 3\n') == 0.0
+
+        # CSV: an object schema is a single data row; nested values are JSON cells.
+        assert score(SchemaType.CSV, person, "name,age\nAnn,3\n") == 1.0
+        assert score(SchemaType.CSV, person, "name,age\nAnn,3\nBob,4\n") == 0.0
+        assert score(SchemaType.CSV, glossary, 'term,entries\nT,"[{""city"": ""A""}, {""city"": ""B""}]"\n') == 1.0
+        assert score(SchemaType.CSV, glossary, "term,entries\nT,not json\n") == 0.0
+        assert score(SchemaType.CSV, glossary, 'term,entries\nT,"[{""town"": ""A""}]"\n') == 0.0
