@@ -1131,3 +1131,11 @@ class TestApp:
         assert score(SchemaType.CSV, glossary, 'term,entries\nT,"[{""city"": ""A""}, {""city"": ""B""}]"\n') == 1.0
         assert score(SchemaType.CSV, glossary, "term,entries\nT,not json\n") == 0.0
         assert score(SchemaType.CSV, glossary, 'term,entries\nT,"[{""town"": ""A""}]"\n') == 0.0
+
+        # [CUSTOM] Answers arrive after the template's "\n\n" separator; surrounding whitespace is ignored
+        # in every format, but it never makes a wrong answer pass.
+        assert score(SchemaType.CSV, cities, "\n\ncity\nRome\nOslo\n") == 1.0
+        assert score(SchemaType.CSV, person, "\n\nname,age\nAnn,3\n\n") == 1.0
+        assert score(SchemaType.CSV, person, "\n\nname,age\nAnn,x\n") == 0.0
+        assert score(SchemaType.JSON, person, '\n\n{"name": "Ann", "age": 3}\n') == 1.0
+        assert score(SchemaType.TOML, person, '\n\nname = "Ann"\nage = 3\n') == 1.0

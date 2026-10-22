@@ -457,7 +457,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         self, schema_type: SchemaType, schema_str: str, response_text: str
     ) -> Tuple[float, Optional[str], Optional[str]]:
         """Returns (reward, error_type, error_message)."""
-        if not response_text or not response_text.strip():
+        # [CUSTOM] The answer arrives with the chat template's separator after </think> ("\n\n").
+        # Surrounding whitespace means nothing in any format, but a leading blank line makes
+        # csv.DictReader read an empty header, so every CSV answer used to score 0.
+        response_text = response_text.strip() if response_text else response_text
+        if not response_text:
             return 0.0, "empty_response", "No assistant response text"
 
         try:
