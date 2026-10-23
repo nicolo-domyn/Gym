@@ -55,6 +55,17 @@ class SingularityEnvironment(BaseEnvironment):
         singularity_image_cache_dir: Path to cache .sif files
         singularity_no_mount: Comma-separated mount types to suppress
             (default "home,tmp,bind-paths"). Use "" to allow all Singularity mounts.
+        singularity_fakeroot: Whether to pass --fakeroot to singularity exec (default True,
+            matches prior unconditional behavior). [CUSTOM] Set to False on clusters
+            where unprivileged user namespaces are disabled -- --fakeroot needs them
+            and fails with "Failed to create user namespace: maximum number of user
+            namespaces exceeded" otherwise. Removing only this flag (keeping 
+            --writable-tmpfs --containall --pid) succeeds unprivileged. Losing --fakeroot
+            means the container's process runs as the real host UID instead of a
+            root-mapped one, so anything that writes to root-owned paths at runtime
+            will fail -- see docs/infrastructure/engineering-notes/ (harbor section) for 
+            the concrete consequence found in a real task's tests/test.sh and the 
+            mitigation.
         workdir: Container working directory override.
     """
 
@@ -68,10 +79,12 @@ class SingularityEnvironment(BaseEnvironment):
         singularity_image_cache_dir: Path | str | None = None,
         singularity_force_pull: bool = False,
         singularity_no_mount: str | None = None,
+        singularity_fakeroot: bool = True,
         workdir: str | None = None,
         *args,
         **kwargs,
     ):
+        self._fakeroot = singularity_fakeroot
         if singularity_image_cache_dir:
             self._image_cache_dir = Path(singularity_image_cache_dir)
         else:
@@ -368,7 +381,7 @@ class SingularityEnvironment(BaseEnvironment):
                 "--pwd",
                 self._workdir,
                 "--writable-tmpfs",
-                "--fakeroot",
+                *(["--fakeroot"] if self._fakeroot else []),
                 "--containall",
                 "--pid",
                 *bind_mounts,

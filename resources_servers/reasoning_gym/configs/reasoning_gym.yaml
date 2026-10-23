@@ -6,6 +6,35 @@ reasoning_gym:
       verified: true
       description: Over 100 tasks including algebra, arithmetic, computation, cognition, geometry, graph theory, logic, and many common games.
       value: Improve robustness, generalization, broad knowledge and reasoning
+
+      # NeMo Skills tools to load. DirectPythonTool calls the sandbox directly (no HTTP sidecar).
+      nemo_skills_tools:
+        - nemo_skills.mcp.servers.python_tool::DirectPythonTool
+
+      # Per-tool configuration overrides
+      nemo_skills_tool_overrides:
+        DirectPythonTool:
+          exec_timeout_s: 10
+
+      # Sandbox configuration. Independently configurable from ns_tools's own
+      # sandbox_host/sandbox_port env vars -- this resources server must work standalone
+      # (no ns_tools in the same job). Respects NEMO_SKILLS_SANDBOX_HOST/PORT if set,
+      # else defaults; set the same values as ns_tools's config when co-deploying to
+      # share one sandbox instance.
+      sandbox_host: ${oc.env:NEMO_SKILLS_SANDBOX_HOST,127.0.0.1}
+      sandbox_port: ${oc.env:NEMO_SKILLS_SANDBOX_PORT,6000}
+
+      # If set (launch.sh sets both), nemo_gym.sandbox_launcher.ensure_sandbox() launches the
+      # sandbox itself inside a Singularity container (see
+      # docs/infrastructure/engineering-notes/sandbox-container-granularity.md). When
+      # co-deployed with ns_tools pointed at the same sandbox_host/sandbox_port, whichever
+      # resources server starts first wins the spawn race (ensure_sandbox() is idempotent
+      # across processes) -- set the same values here as in ns_tools.yaml.
+      sandbox_sif_path: ${oc.env:NEMO_SKILLS_SANDBOX_SIF_PATH,""}
+      sandbox_venv_path: ${oc.env:NEMO_SKILLS_SANDBOX_VENV_PATH,""}
+
+      # Disable session replay after sandbox worker restarts (improves stability)
+      disable_session_restore: true
 reasoning_gym_simple_agent:
   responses_api_agents:
     simple_agent:

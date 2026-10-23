@@ -13,6 +13,16 @@ swebench_commit=$SWEBENCH_COMMIT
 cd $setup_dir
 
 export UV_INSTALL_DIR="$uv_dir"
+# [FIXED 2026-10-13] uv's installer modifies the invoking user's shell rc file
+# (~/.bashrc/.zshrc) by default to source "$UV_INSTALL_DIR/env" on every new shell --
+# confirmed this had been silently happening on every run of this setup script, leaving
+# stale `source ".../swe_<dataset>_setup/uv/env"` lines in a real user's .bashrc pointing at
+# this project's own per-dataset scratch directories. Completely unnecessary: this script
+# already does its own `export PATH="$uv_dir/bin:$PATH"` below, scoped to just this process,
+# which is all any caller of this script needs. UV_NO_MODIFY_PATH=1 is uv's documented
+# opt-out (confirmed by reading install.sh directly) -- never touch global shell state from
+# a project setup script.
+export UV_NO_MODIFY_PATH=1
 export UV_PYTHON_INSTALL_DIR="$python_dir"
 if [ ! -f "$uv_dir/bin/uv" ]; then
     echo "Installing uv to $uv_dir..."
