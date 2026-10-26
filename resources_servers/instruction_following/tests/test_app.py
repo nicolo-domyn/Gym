@@ -169,6 +169,17 @@ class TestApp:
         )
         self._run_verify_test(real_request, False, 0.0, [False])
 
+    def test_nth_paragraph_after_leading_newlines(self):
+        """The "\\n\\n" a reasoning model emits after </think> is not an empty first paragraph."""
+        real_request = self._create_real_request(
+            instruction_ids=["length_constraints:nth_paragraph_first_word"],
+            prompt="There should be 3 paragraphs. Paragraph 2 must start with word priest.",
+            kwargs=[{"num_paragraphs": 3, "nth_paragraph": 2, "first_word": "priest"}],
+            response_content="\n\nOne paragraph.\n\npriest starts this one.\n\nThird paragraph.",
+            request_id=102,
+        )
+        self._run_verify_test(real_request, True, 1.0, [True])
+
     def test_multiple_constraints_positive(self):
         """Test multiple constraints together - should pass both."""
         real_request = self._create_real_request(

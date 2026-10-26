@@ -254,7 +254,10 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
             last_output = body.response.output[-1]
             if hasattr(last_output, "content") and last_output.content:
                 # Extract text from the nested content structure
-                final_response_text = last_output.content[0].text
+                # [CUSTOM] Reasoning models open the answer with "\n\n" after </think>; checkers that split
+                # on "\n\n" (nth_paragraph_first_word) would count an empty first paragraph, so the
+                # answer is stripped as the SO server does.
+                final_response_text = last_output.content[0].text.strip()
 
         # Verify each instruction using the verifiable instructions
         instruction_list = body.instruction_id_list
