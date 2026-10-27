@@ -111,7 +111,9 @@ logger = logging.getLogger(__name__)
 _HEALTH_POLL = 2.0
 _HEALTH_TIMEOUT = 120.0
 _PROXY_HEALTH_TIMEOUT = 30.0
-_WATCHDOG_INTERVAL = 10.0
+# [CUSTOM-SANDBOX-WATCHDOG-INTERVAL 2026-10-23] was 10.0, increased to 120 to avoid 
+# killing healthy processes.
+_WATCHDOG_INTERVAL = 120.0
 _DEFAULT_PROXY_REQUEST_TIMEOUT = 120.0
 _DEFAULT_STARTUP_PROBE_TIMEOUT = 15.0
 _QUICK_HEALTH_CHECK_TIMEOUT = 2.0
@@ -138,9 +140,12 @@ _STARTUP_PROBE_STEPS = (
 # resources servers themselves) counts against the SAME budget once inherited by the sandbox's
 # descendants. Set generously high: this exists to catch a genuinely runaway fork bomb, not to
 # tightly budget the sandbox specifically -- a tight value risks starving the rest of the job's
-# legitimate processes under the same account. Needs empirical tuning once we can observe a
-# real job's typical process count on one node; not derived from any measurement yet.
-_DEFAULT_MAX_PROCESSES = 4096
+# legitimate processes under the same account.
+#
+# [CUSTOM-SANDBOX-MAX-PROCESSES 2026-10-23] Was 4096, confirmed too tight once the sandbox
+# itself started creating threads with "RuntimeError: can't start new thread".
+# This is far under Leonardo's per-UID ceiling (~2,059,665 on a compute node).
+_DEFAULT_MAX_PROCESSES = 65536
 _DEFAULT_MEMORY_LIMIT_MB = 2048
 _DEFAULT_CPU_TIME_LIMIT_S = 3600  # aggregate CPU seconds for the sandbox's whole lifetime, generous since long-lived
 _DEFAULT_MAX_FILE_SIZE_MB = 512
@@ -399,7 +404,7 @@ def _check_health(port: int, timeout_s: float = _QUICK_HEALTH_CHECK_TIMEOUT) -> 
         with httpx.Client(timeout=timeout_s) as client:
             resp = client.get(f"http://127.0.0.1:{port}/health")
             return resp.status_code == 200
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError):
         return False
 
 

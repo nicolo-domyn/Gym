@@ -62,6 +62,21 @@ class ReasoningGymResourcesServerConfig(BaseResourcesServerConfig):
     sandbox_sif_path: str = ""
     sandbox_venv_path: str = ""
 
+    # [CUSTOM-REASONING-GYM-SANDBOX-PROXY 2026-10-23] local_sandbox_server.py was a bare
+    # single-threaded `app.run(port=6000)` -- it served exactly one request at a time. 
+    # Under concurrent load, excess connections got dropped with
+    # "Server disconnected without sending a response" (httpcore.RemoteProtocolError)
+    # instead of queued. Two fixes combined:
+    # (1) sandbox_runtime/patch_local_sandbox_threaded.py makes the upstream server itself
+    #     threaded, so it can actually serve many requests concurrently instead of just
+    #     queuing them one at a time;
+    # (2) sandbox_proxy_port routes traffic through sandbox_launcher.py's existing throttling
+    #     proxy (_start_proxy) instead of the raw port, which turns any remaining overload
+    #     into a clean, catchable 503 instead of a dropped connection.
+    # (3) With the upstream no longer single-threaded, proxy_max_concurrency=16 is safe.
+    sandbox_proxy_port: Optional[int] = 6001
+    sandbox_proxy_max_concurrency: int = 16
+
     # Verbose logging for tool execution timing (disabled by default)
     verbose_tool_logging: bool = False
 
@@ -109,7 +124,18 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
                     venv_path=self.config.sandbox_venv_path,
                     port=int(self.config.sandbox_port),
                     network="none",
+                    proxy_port=self.config.sandbox_proxy_port,
+                    proxy_max_concurrency=self.config.sandbox_proxy_max_concurrency,
                 )
+                # [CUSTOM-REASONING-GYM-SANDBOX-PROXY 2026-10-23] see sandbox_proxy_port's own
+                # comment above -- this server's own tool calls (_initialize_nemo_skills_tools
+                # below reads sandbox_port) must target the proxy's advertised port, not the raw
+                # single-threaded sandbox port, once a proxy is in use. The background watchdog
+                # started inside ensure_sandbox() always health-checks the raw port directly by
+                # design (it needs to know if the underlying process itself is alive, independent
+                # of the proxy) -- that part is unaffected and unchanged.
+                if self.config.sandbox_proxy_port:
+                    self.config.sandbox_port = str(self.config.sandbox_proxy_port)
             self._initialize_nemo_skills_tools()
 
             # Register a catch-all endpoint for tool execution
@@ -220,6 +246,21 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
             logger.warning(f"Request timeout executing tool {tool_name}: {e}")
             result = {"error": "Request timeout", "process_status": "timeout"}
 
+        # [CUSTOM-REASONING-GYM-TOOLARGS 2026-10-24] A model omitting a required tool
+        # argument (e.g. calling the python-exec tool with no "code" key) previously fell
+        # through to the generic `except Exception` below: it was *not* an uncaught crash
+        # (that branch already returns a clean response), but `str(KeyError('code'))` is
+        # just `"'code'"` -- a cryptic, unhelpful message that gives the model no signal
+        # about what argument was missing or that the fix is to include it. Logged at
+        # `exception` level too, which is misleading severity for a routine malformed
+        # tool call, not an internal bug. Give the model an actionable message instead, and
+        # log at `warning` since this is an expected, recoverable model-output issue, not
+        # unexpected server state.
+        except KeyError as e:
+            missing_arg = str(e).strip("'\"")
+            logger.warning(f"Tool '{tool_name}' called without required argument '{missing_arg}': {e}")
+            result = {"error": f"Missing required argument: '{missing_arg}'"}
+
         except Exception as e:
             logger.exception(f"Error executing tool {tool_name}: {e}")
             result = {"error": str(e)}
@@ -243,6 +284,17 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
 
         # Return result as plain text to avoid double JSON serialization
         if isinstance(result, str):
+            # [CUSTOM-REASONING-GYM-SURROGATE-ENCODE 2026-10-23] Model-executed code can
+            # construct a Python str containing lone/unpaired UTF-16 surrogate code points
+            # (e.g. a bad \uD8xx-style escape or buggy surrogate-pair arithmetic it wrote
+            # itself) -- valid as an in-memory str, but PlainTextResponse.render()'s own
+            # `content.encode(self.charset)` has no such tolerance and raises
+            # UnicodeEncodeError, which was previously uncaught here and surfaced as an
+            # unrelated HTTP 500 instead of the tool's real output. Round-tripping through
+            # utf-8 with errors="replace" keeps the real output (garbled characters become
+            # U+FFFD, not dropped) so the model still gets to see and reason about what it
+            # actually produced, instead of a meaningless transport error.
+            result = result.encode("utf-8", errors="replace").decode("utf-8")
             return PlainTextResponse(result)
         return PlainTextResponse(json.dumps(result))
 

@@ -153,6 +153,14 @@ class Terminus2NemoGym(Terminus2):
             if context.metadata is not None:
                 context.metadata["n_episodes"] = self._n_episodes
             self._write_agent_error_flags()
+            # [UPSTREAM-FIX nemo-nemo/Gym#1669, a7c4c7bf3] Close the LLM's persistent HTTP
+            # client now the episode is done.
+            llm = getattr(self, "_llm", None)
+            if isinstance(llm, NemoGymLLM):
+                try:
+                    await llm.aclose()
+                except Exception:
+                    pass  # teardown is best-effort; never fail the trial on cleanup
 
     def _write_agent_error_flags(self) -> None:
         """Write agent error flags to disk for app.py to pick up."""

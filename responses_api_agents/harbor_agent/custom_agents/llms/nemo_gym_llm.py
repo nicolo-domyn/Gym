@@ -58,6 +58,21 @@ class NemoGymLLM(BaseLLM):
         self._collect_rollout_details = collect_rollout_details
         self._model_info = model_info or {}
         self._timeout_sec = timeout_sec
+
+        # [UPSTREAM-FIX nemo-nemo/Gym#1669, a7c4c7bf3] Persistent HTTP client, reused
+        # across every turn of the episode. The Gym vllm_model server pins a session to
+        # one vLLM engine via a cookie-based SessionMiddleware
+        # (responses_api_models/vllm_model/app.py); a fresh client per call drops that
+        # cookie, so the server mints a NEW session_id each turn and round-robins it to a
+        # (usually different) engine. With many DP engines that means the growing
+        # conversation prefix is almost never warm in the engine handling the next turn
+        # -> prefix-cache miss -> the full context is re-prefilled every turn. Reusing one
+        # client keeps the session cookie, so the whole episode lands on the same engine
+        # and prefix caching only prefills the new tokens each turn. Lazily created on
+        # first use. See related:
+        # - commit https://github.com/NVIDIA-NeMo/Gym/commit/a7c4c7bf3735f240870b5b09bc241f4490c0e62e
+        # - PR https://github.com/NVIDIA-NeMo/Gym/pull/1669
+        self._http_client: httpx.AsyncClient | None = None
         # [CUSTOM 2026-10-07] BaseLLM never sets self._logger -- the two pre-existing
         # call sites below (get_model_context_limit/get_model_output_limit) were latent
         # AttributeErrors on their fallback path. `logger`, when passed, is the real
@@ -270,8 +285,13 @@ class NemoGymLLM(BaseLLM):
         self._logger.info(f"[nemo_gym_llm] attempt={attempt} POST {endpoint} (timeout={timeout}s) starting")
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(endpoint, json=payload)
+            # [UPSTREAM-FIX nemo-nemo/Gym#1669, a7c4c7bf3] Reuse the persistent client so
+            # the session cookie (and thus the engine the session is pinned to) carries
+            # across turns. Timeout is applied per-request, so the per-call override is
+            # preserved regardless of the client's default.
+            if self._http_client is None:
+                self._http_client = httpx.AsyncClient(timeout=timeout)
+            response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
         except Exception as e:
             elapsed = time.monotonic() - start
             self._logger.info(
@@ -294,6 +314,16 @@ class NemoGymLLM(BaseLLM):
             response.raise_for_status()
 
         return response.json()
+
+    async def aclose(self) -> None:
+        """Close the persistent HTTP client. Called at episode end; best-effort
+        (the per-trial process exits anyway, but this avoids leaked connections /
+        'client was not closed' warnings when many episodes run in one process)."""
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            finally:
+                self._http_client = None
 
     def _chat_completions_endpoint(self) -> str:
         if self._api_base.endswith("/v1"):

@@ -33,6 +33,16 @@ reasoning_gym:
       sandbox_sif_path: ${oc.env:NEMO_SKILLS_SANDBOX_SIF_PATH,""}
       sandbox_venv_path: ${oc.env:NEMO_SKILLS_SANDBOX_VENV_PATH,""}
 
+      # [CUSTOM-REASONING-GYM-SANDBOX-PROXY 2026-10-23] see ReasoningGymResourcesServerConfig's
+      # own comment on sandbox_proxy_port in app.py for the full story: the underlying sandbox
+      # server used to be single-threaded and drop connections under concurrent load without
+      # this. NOTE: ns_tools's own sandbox_port config does not set this yet -- if reasoning_gym
+      # is ever co-deployed with ns_tools sharing one sandbox instance, ns_tools needs the same
+      # proxy_port wiring too, or the two servers will disagree on the advertised port.
+      # max_concurrency set to 16 (the library default).
+      sandbox_proxy_port: 6001
+      sandbox_proxy_max_concurrency: 16
+
       # Disable session replay after sandbox worker restarts (improves stability)
       disable_session_restore: true
 reasoning_gym_simple_agent:

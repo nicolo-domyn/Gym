@@ -117,7 +117,14 @@ NEW_BASE_COMMIT = """    if DATASET_TYPE == "SWE-smith":
         # `git apply`; with it, the tree hash correctly changes and the working tree is clean
         # afterward (so complete_runtime()'s later `git diff swebench_baseline` only ever shows
         # the agent's own real edits).
-        action = CmdRunAction(command="git add -A && git commit -q -m 'swesmith bug injection'")
+        #
+        # [CUSTOM-SWESMITH-NOVERIFY 2026-10-23] --no-verify: some SWE-smith images' repos ship a
+        # real `.git/hooks/pre-commit` from their upstream history (e.g. mybatis's shells to a
+        # bare `mvn`, which the image only has as `./mvnw`). This commit is pure bookkeeping to
+        # position swebench_baseline correctly (see comment above) -- it has nothing to do with
+        # the actual test execution/grading, so skipping its hook is safe. Without --no-verify, a
+        # failing hook crashes this assert_and_raise below and the whole rollout with it.
+        action = CmdRunAction(command="git add -A && git commit -q --no-verify -m 'swesmith bug injection'")
         action.set_hard_timeout(600)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)

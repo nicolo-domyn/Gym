@@ -205,6 +205,21 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
     )
     # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] END (field)
 
+    # [CUSTOM-COPYOUT-TIMEOUT 2026-10-23] A degraded node's filesystem/I/O path can make `cp -a`
+    # hang forever in kernel D-state (uninterruptible I/O wait) instead of failing.
+    # Without a timeout, this permanently strands the rollout's worker thread (and the trainer
+    # slot it holds) since the retry loop in _run_copyout_cp never gets a chance to run: it only
+    # retries after the subprocess call *returns*. 1200s seems to be the right value not to kill
+    # healthy copyout processes.
+    copyout_timeout_seconds: float = Field(
+        default=1200.0,
+        description=(
+            "[CUSTOM-COPYOUT-TIMEOUT] Per-attempt timeout (seconds) for a copy-out `cp -a` "
+            "subprocess. A hang past this is treated as a transient failure (killed and retried "
+            "like any other), not a total budget across all retries."
+        ),
+    )
+
     dataset_path: Optional[str] = Field(
         default=None,
         description="Path to the dataset for SWE-bench evaluation",
@@ -1726,9 +1741,9 @@ class RunOpenHandsAgent(BaseModel):
             # Wait for completion with timeout
             await asyncio.wait_for(active_command.process.communicate(), timeout=command.timeout)
         except asyncio.TimeoutError:
-            if active_command.process.returncode is None:
-                active_command.process.kill()
-                await active_command.process.wait()
+            await _kill_and_reap_process(
+                active_command.process, context=f"{command.mode} container command for {self.config.instance_id}"
+            )
             active_command.log_file.close()
             log_tail = active_command.log_file_path.read_text(errors="replace")[-4000:]
             raise ValueError(
@@ -2019,6 +2034,54 @@ def _find_sif_normalized(container_dir: str, image_stem: str) -> list[str]:
     ]
 
 
+# [CUSTOM-COPYOUT-DSTATE-REAP 2026-10-26] `process.kill()` sends SIGKILL, but a process blocked
+# in kernel D-state (uninterruptible I/O wait) cannot be killed by ANY signal until the
+# I/O it's blocked on completes or the filesystem driver gives up. `await process.wait()`
+# immediately after `kill()` therefore hangs for exactly as long as `communicate()` itself would
+# have -- the timeout just moves one line down instead of being eliminated.
+# Fix: bound the post-kill reap with its own short grace period. If the process hasn't exited
+# within it, it's genuinely D-state-stuck -- stop awaiting it (the orphan is leaked at the OS
+# level, but that's strictly better than the coroutine, its semaphore slot, and its trainer slot
+# being leaked right along with it) and let the caller treat this attempt as failed/retryable.
+async def _kill_and_reap_process(process: asyncio.subprocess.Process, context: str, grace_seconds: float = 15.0) -> bool:
+    """Kill `process` and wait up to `grace_seconds` for it to actually exit.
+
+    Returns True if the process was reaped, False if it's still alive after the grace period
+    (almost certainly D-state) and has been abandoned -- callers must not wait on it further.
+    """
+    if process.returncode is not None:
+        return True
+    process.kill()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+        return True
+    except asyncio.TimeoutError:
+        print(
+            f"WARNING: {context} did not exit within {grace_seconds:.0f}s of being killed -- "
+            f"likely stuck in kernel D-state on a degraded node. Abandoning it (leaked at the OS "
+            f"level) rather than blocking this rollout on it indefinitely.",
+            flush=True,
+        )
+        return False
+
+
+async def _run_chmod_best_effort(args: list[str], context: str, timeout_seconds: float = 120.0) -> None:
+    """Best-effort `chmod` cleanup used between copy-out retries / after a successful copy-out.
+
+    Never raises: a stuck or failed chmod here would otherwise either hang the caller forever
+    (same D-state risk as the main copy-out, see [CUSTOM-COPYOUT-DSTATE-REAP] above -- this
+    helper previously had NO timeout protection at all) or abort a rollout over a step whose
+    only purpose is to unblock a *subsequent* retry/mount. Logs and moves on either way.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "chmod", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        await _kill_and_reap_process(process, context=context)
+
+
 async def _run_copyout_cp(
     apptainer_binary: str,
     mount_src: Path,
@@ -2027,6 +2090,7 @@ async def _run_copyout_cp(
     semaphore: Semaphore,
     max_attempts: int = 5,
     base_backoff_seconds: float = 1.0,
+    timeout_seconds: float = 600.0,
 ) -> tuple[int, str]:
     """Runs `<apptainer_binary> exec ... cp -a <src_in_container> /mnt/`, retrying on
     transient failures (NOT on `cp`'s own failures, e.g. a path genuinely missing in this
@@ -2060,9 +2124,21 @@ async def _run_copyout_cp(
     fails trying to overwrite its own earlier output: "cannot create regular file '<path>':
     Permission denied", a self-inflicted failure, not a real one. Fix: before retrying, make the
     whole destination recursively writable so `cp -a` can freely overwrite/continue.
+
+    [CUSTOM-COPYOUT-TIMEOUT 2026-10-23] Unlike the two failure modes above, a degraded node's
+    filesystem/I/O path can make `cp -a` hang indefinitely instead of exiting with any error
+    at all. `timeout_seconds` bounds each attempt; a hang past it is killed and treated as
+    transient (retried like any other), so a bad node degrades one rollout's latency instead
+    of silently stalling the whole job forever.
     """
     returncode, stderr_text = 1, ""
+    # [CUSTOM-COPYOUT-TIMING 2026-10-25] No visibility into how long any of this actually takes
+    # in production -- when a step stalls for hours, there's no way to tell whether it's many
+    # individually-slow copy-outs or something else without this. Logs per-attempt and total
+    # elapsed time, keyed by the container/image and the in-container path being copied.
+    op_start = time.time()
     for attempt in range(1, max_attempts + 1):
+        attempt_start = time.time()
         async with semaphore:
             process = await asyncio.create_subprocess_exec(
                 apptainer_binary,
@@ -2080,13 +2156,45 @@ async def _run_copyout_cp(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await process.communicate()
-            returncode = process.returncode
+            try:
+                _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+                returncode = process.returncode
+            except asyncio.TimeoutError:
+                await _kill_and_reap_process(process, context=f"copy-out cp -a of {src_in_container} from {container}")
+                returncode = 255
+                stderr_text = (
+                    f"FATAL: copy-out hung past {timeout_seconds:.0f}s timeout (killed) -- "
+                    "likely a degraded node filesystem/I/O path, not a container-creation issue"
+                )
+                if attempt < max_attempts:
+                    print(
+                        f"WARNING: copy-out of {src_in_container} from {container} timed out "
+                        f"(attempt {attempt}/{max_attempts}, {time.time() - attempt_start:.1f}s this "
+                        f"attempt, treating as transient -- retrying): {stderr_text}",
+                        flush=True,
+                    )
+                    # [CUSTOM-COPYOUT-RETRY-CLOBBER 2026-10-22] same clobber risk as any other
+                    # retry: the killed `cp -a` may have left partially-copied read-only files.
+                    await _run_chmod_best_effort(
+                        ["-R", "u+w", str(mount_src)], context=f"post-timeout chmod of {mount_src}"
+                    )
+                    await asyncio.sleep(random.uniform(0, base_backoff_seconds * (2 ** (attempt - 1))))
+                continue
         if returncode == 0:
+            print(
+                f"INFO: copy-out of {src_in_container} from {container} succeeded in "
+                f"{time.time() - op_start:.1f}s total ({attempt} attempt(s))",
+                flush=True,
+            )
             return 0, ""
         stderr_text = stderr.decode(errors="replace")
         is_transient_failure = returncode == 255 or "FATAL" in stderr_text or "Input/output error" in stderr_text
         if not is_transient_failure:
+            print(
+                f"WARNING: copy-out of {src_in_container} from {container} failed non-transiently "
+                f"after {time.time() - op_start:.1f}s ({attempt} attempt(s)): {stderr_text}",
+                flush=True,
+            )
             return returncode, stderr_text
         if attempt < max_attempts:
             # Add exponential backoff (base_backoff_seconds * 2**(attempt-1) plus random
@@ -2095,23 +2203,20 @@ async def _run_copyout_cp(
             backoff = random.uniform(0, max_backoff)
             print(
                 f"WARNING: copy-out of {src_in_container} from {container} failed (attempt "
-                f"{attempt}/{max_attempts}, looks like a transient failure -- retrying in "
-                f"{backoff:.1f}s): {stderr_text}",
+                f"{attempt}/{max_attempts}, {time.time() - attempt_start:.1f}s this attempt, looks "
+                f"like a transient failure -- retrying in {backoff:.1f}s): {stderr_text}",
                 flush=True,
             )
             # [CUSTOM-COPYOUT-RETRY-CLOBBER 2026-10-22] see docstring above -- host-side chmod
             # (no container involved, mount_src is already our own host directory) so the next
             # `cp -a` can overwrite any read-only leftovers from this failed attempt.
-            chmod_process = await asyncio.create_subprocess_exec(
-                "chmod",
-                "-R",
-                "u+w",
-                str(mount_src),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await chmod_process.communicate()
+            await _run_chmod_best_effort(["-R", "u+w", str(mount_src)], context=f"post-failure chmod of {mount_src}")
             await asyncio.sleep(backoff)
+    print(
+        f"WARNING: copy-out of {src_in_container} from {container} exhausted all {max_attempts} "
+        f"attempts after {time.time() - op_start:.1f}s total: {stderr_text}",
+        flush=True,
+    )
     return returncode, stderr_text
 
 
@@ -2136,6 +2241,10 @@ _COPYOUT_SAFE_TO_SKIP_PATTERNS = [
     # existing object, only adds new ones, so a missing/unreadable existing object can't corrupt
     # anything the agent or eval harness does with that nested repo.
     re.compile(r"\.git/objects/"),
+    # [CUSTOM-COPYOUT-ALLOWLIST 2026-10-23] contentsquare/chproxy's own Go test scratch dirs
+    # (cache/async_cache_test.go's asyncTestDir, proxy_test.go's testCacheDir).The tests own
+    # this directory's full lifecycle and recreate it fresh regardless of what a copy-out preserves.
+    re.compile(r"(^|/)(async-test-data|test-cache-data)(/|$)"),
 ]
 
 _CP_FAILED_PATH_RE = re.compile(r"cp: cannot [a-z ]+ '([^']+)'")
@@ -2152,6 +2261,82 @@ def _copyout_failures_are_all_safe_to_skip(stderr_text: str) -> bool:
     if not failed_paths:
         return False
     return all(any(pattern.search(path) for pattern in _COPYOUT_SAFE_TO_SKIP_PATTERNS) for path in failed_paths)
+
+
+# [CUSTOM-COPYOUT-PRUNE-RUST-INCREMENTAL 2026-10-25] `_COPYOUT_SAFE_TO_SKIP_PATTERNS` already
+# proves this exact directory shape is common enough to warrant its own regex (1292 occurrences
+# logged as "cp: cannot ..." failures) -- but that mechanism is purely reactive: it tolerates the
+# failure *after* `cp -a` already spent time walking into a potentially huge, many-small-file
+# Rust incremental-compilation cache. Deleting it before the copy-out removes the slow
+# walk/copy entirely instead of merely tolerating the errors afterward. Scoped narrowly to the
+# Rust pattern only, NOT generalized to the other four patterns in `_COPYOUT_SAFE_TO_SKIP_PATTERNS`
+# (node_modules/Gradle/sbt/git-objects).
+async def _prune_rust_incremental_cache(
+    apptainer_binary: str,
+    container: str,
+    src_in_container: str,
+    semaphore: Semaphore,
+    timeout_seconds: float = 60.0,
+) -> None:
+    """Best-effort: delete target/{debug,release}/incremental/ under `src_in_container` inside
+    `container`, before a copy-out walks it. Never raises -- a failure here (prune command itself
+    errors, times out, or the path doesn't exist) just means the subsequent `cp -a` falls back to
+    its existing slow-but-correct behavior, so this is purely an optimization, never a
+    correctness dependency.
+    """
+    # Same reasoning as CUSTOM-COPYOUT-TIMING on _run_copyout_cp -- need per-op timing
+    # tied to the container to tell apart "this instance's prune is itself slow" from
+    # "the subsequent cp -a is the slow part".
+    op_start = time.time()
+    async with semaphore:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                apptainer_binary,
+                "exec",
+                "--containall",
+                "--cleanenv",
+                container,
+                "find",
+                src_in_container,
+                "-mindepth",
+                "1",
+                "-type",
+                "d",
+                "-path",
+                "*/target/*/incremental",
+                "-prune",
+                "-exec",
+                "rm",
+                "-rf",
+                "{}",
+                "+",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+            print(
+                f"INFO: prune of {src_in_container} in {container} succeeded in "
+                f"{time.time() - op_start:.1f}s",
+                flush=True,
+            )
+        except asyncio.TimeoutError as e:
+            # [CUSTOM-COPYOUT-DSTATE-REAP 2026-10-26] previously left `process` running
+            # unkilled on timeout -- same D-state leak risk as the main copy-out, just silent
+            # since this prune is already non-fatal to the caller either way.
+            await _kill_and_reap_process(process, context=f"prune of {src_in_container} in {container}")
+            print(
+                f"WARNING: pruning Rust incremental cache under {src_in_container} in {container} "
+                f"failed after {time.time() - op_start:.1f}s (non-fatal, falling back to copying it "
+                f"as-is): {type(e).__name__}: {e}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"WARNING: pruning Rust incremental cache under {src_in_container} in {container} "
+                f"failed after {time.time() - op_start:.1f}s (non-fatal, falling back to copying it "
+                f"as-is): {type(e).__name__}: {e}",
+                flush=True,
+            )
 
 
 class SWEBenchWrapper(SimpleResponsesAPIAgent):
@@ -2540,8 +2725,21 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         for image_path in copy_paths:
             dest = copy_root / image_path.lstrip("/")
             dest.parent.mkdir(parents=True, exist_ok=True)
+            # [CUSTOM-COPYOUT-PRUNE-RUST-INCREMENTAL 2026-10-25] see that function's own
+            # docstring -- best-effort, never blocks the actual copy-out below.
+            await _prune_rust_incremental_cache(
+                self.config.apptainer_binary,
+                container,
+                image_path,
+                self._copyout_sem,
+            )
             returncode, stderr_text = await _run_copyout_cp(
-                self.config.apptainer_binary, dest.parent, container, image_path, self._copyout_sem
+                self.config.apptainer_binary,
+                dest.parent,
+                container,
+                image_path,
+                self._copyout_sem,
+                timeout_seconds=self.config.copyout_timeout_seconds,
             )
             if returncode != 0:
                 if returncode == 255 or "FATAL" in stderr_text:
@@ -2583,10 +2781,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                     flush=True,
                 )
 
-            chmod_process = await asyncio.create_subprocess_exec(
-                "chmod", "-R", "a+rwX", str(dest), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            await chmod_process.communicate()
+            await _run_chmod_best_effort(["-R", "a+rwX", str(dest)], context=f"post-copyout chmod of {dest}")
 
             mount_args.append(f"--mount type=bind,src={dest},dst={image_path}")
 
@@ -2666,7 +2861,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] self._copyout_sem bounds concurrent copy-out
             # exec calls specifically -- see SWEBenchWrapperConfig.copyout_concurrency.
             returncode, stderr_text = await _run_copyout_cp(
-                self.config.apptainer_binary, r2e_tests_dest, container, "/r2e_tests/.", self._copyout_sem
+                self.config.apptainer_binary,
+                r2e_tests_dest,
+                container,
+                "/r2e_tests/.",
+                self._copyout_sem,
+                timeout_seconds=self.config.copyout_timeout_seconds,
             )
             if returncode != 0:
                 if returncode == 255 or "FATAL" in stderr_text:
@@ -2680,15 +2880,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                     flush=True,
                 )
             else:
-                chmod_process = await asyncio.create_subprocess_exec(
-                    "chmod",
-                    "-R",
-                    "a+rwX",
-                    str(r2e_tests_dest),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                await _run_chmod_best_effort(
+                    ["-R", "a+rwX", str(r2e_tests_dest)], context=f"post-copyout chmod of {r2e_tests_dest}"
                 )
-                await chmod_process.communicate()
 
         for image_path in hide_paths:
             dest = copy_root / image_path.lstrip("/")

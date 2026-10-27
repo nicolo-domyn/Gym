@@ -111,7 +111,11 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
             limit=cfg.global_aiohttp_connector_limit // num_workers,
             limit_per_host=cfg.global_aiohttp_connector_limit_per_host // num_workers,
         ),
-        timeout=ClientTimeout(),
+        # [CUSTOM-AIOHTTP-TOTAL-TIMEOUT 2026-10-24] `ClientTimeout()` with no args means NO
+        # timeout at all -- every call made via this global client (agent /run calls
+        # included, via rollout_collection.py's _post_subroutine) can hang forever if the
+        # downstream handler ever fails without an explicit sub-routine error.
+        timeout=ClientTimeout(total=3600),
         cookie_jar=DummyCookieJar(),
     )
 
