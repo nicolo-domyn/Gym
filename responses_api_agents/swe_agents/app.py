@@ -15,6 +15,7 @@ import asyncio
 import glob
 import importlib.util
 import json
+import logging
 import os
 import random
 import re
@@ -57,7 +58,11 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.profiling import Profiler
+from nemo_gym.vm_launcher import _VM_LIB_SH, ensure_vm, run_in_vm
 from responses_api_models.vllm_model.app import VLLMConverter, split_responses_input_output_items
+
+
+logger = logging.getLogger(__name__)
 
 
 ########################################
@@ -118,19 +123,31 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
         default="docker://swebench/sweb.eval.x86_64.{instance_id}", description="Container path template"
     )
 
-    # [CUSTOM-SWEREBENCH-V2 2026-10-09] Directory holding one full `git clone` per repo
-    # (named "<org>__<repo>", e.g. "tobymao__sqlglot"), used by _copy_out_writable_paths as the
-    # source for a per-rollout writable copy bind-mounted onto /{repo_name}. This lets many
-    # unrelated repos share ONE generic env image, keyed by 
-    # (apt packages, python version, pip packages) instead of needing a pre-built image per
-    # instance. Only applies to rows whose dataset_name is exactly "SWE-rebench-V2". See
-    # _find_container/_copy_out_writable_paths for the rest of this mechanism.
-    swe_rebench_repo_mirrors_dir: Optional[str] = Field(
+    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2
+    # images are built with root-owned content. To circumvent this, run them from inside a VM,
+    # where we are root. 
+    # In detail,the  apptainer command is run inside a per-node QEMU/KVM VM sidecar (see
+    # nemo_gym/vm_launcher.py). We only create one persistent VM per node, shared across every
+    # rollout happening in that node -- see vm_launcher.py's module docstring for the full 
+    # lifecycle description of the VM.
+    vm_golden_image_dir: Optional[str] = Field(
         default=None,
         description=(
-            "Directory of per-repo git mirrors ('<org>__<repo>' subdirs) for SWE-rebench-V2's "
-            "shared-image mode. Required only when a job's data includes dataset_name == "
-            "'SWE-rebench-V2' rows."
+            "[CUSTOM-VM-SIDECAR] Directory holding golden.qcow2 and the unprivileged QEMU "
+            "install. Required when a job's data includes any of "
+            "SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2 rows "
+            "-- see _uses_vm_sidecar()."
+        ),
+    )
+    vm_lustre_share_roots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "[CUSTOM-VM-SIDECAR] Host directories shared into the VM via virtio-9p at boot, at "
+            "the same absolute path, so the existing _build_apptainer_command mount strings "
+            "need no changes. Must cover every host path that command binds for the affected "
+            "dataset types: the container_formatter image directory/directories, "
+            "base_results_dir's root (persistent_dir lives under it), and the "
+            "openhands/swebench/r2e_gym/swe_rebench/swesmith setup dirs' root(s)."
         ),
     )
 
@@ -186,39 +203,6 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
 
     # Concurrency control
     concurrency: int = Field(default=256, description="Maximum number of concurrent SWE-bench runs")
-
-    # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] START -- revert by deleting this field, the
-    # `self._copyout_sem` line in model_post_init, the `semaphore` param + `async with` block in
-    # _run_copyout_cp, and the `self._copyout_sem` args at both call sites in
-    # _copy_out_writable_paths. `concurrency` (above) bounds concurrent full rollouts, not
-    # concurrent copy-out subprocess calls -- at scale, hundreds of simultaneous copy-outs can
-    # exhaust the node's finite pool of kernel loop devices (see _run_copyout_cp's docstring).
-    # This caps concurrent copy-out `apptainer exec` calls specifically, independent of
-    # `concurrency`. 100 is a conservative value under this cluster's safe concurrency threshold.
-    copyout_concurrency: int = Field(
-        default=100,
-        description=(
-            "[CUSTOM-COPYOUT-SEMAPHORE] Maximum number of concurrent copy-out `apptainer exec` "
-            "subprocess calls (independent of `concurrency`, which bounds full rollouts). Caps "
-            "contention for the node's finite kernel loop-device pool."
-        ),
-    )
-    # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] END (field)
-
-    # [CUSTOM-COPYOUT-TIMEOUT 2026-10-23] A degraded node's filesystem/I/O path can make `cp -a`
-    # hang forever in kernel D-state (uninterruptible I/O wait) instead of failing.
-    # Without a timeout, this permanently strands the rollout's worker thread (and the trainer
-    # slot it holds) since the retry loop in _run_copyout_cp never gets a chance to run: it only
-    # retries after the subprocess call *returns*. 1200s seems to be the right value not to kill
-    # healthy copyout processes.
-    copyout_timeout_seconds: float = Field(
-        default=1200.0,
-        description=(
-            "[CUSTOM-COPYOUT-TIMEOUT] Per-attempt timeout (seconds) for a copy-out `cp -a` "
-            "subprocess. A hang past this is treated as a transient failure (killed and retried "
-            "like any other), not a total budget across all retries."
-        ),
-    )
 
     dataset_path: Optional[str] = Field(
         default=None,
@@ -294,16 +278,13 @@ class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapper
     output_for_eval_path: Path
     model_patch_path: Path
     container: str
-    # [CUSTOM] --mount args papering over this container's root-owned, non-writable
-    # paths (e.g. /testbed) with a per-rollout writable copy -- see _copy_out_writable_paths.
-    #
     # The agent routinely creates untracked scaffold files during its own OpenHands session
-    # (e.g. `install.sh`, `test_sleep.py`) that persist into the shared writable copy.
+    # (e.g. `install.sh`, `test_sleep.py`) that would otherwise persist into a shared mount.
     # When the model's own patch.diff later tries to recreate that same file as "new",
     # `git apply` refuses with "already exists in working directory" and the WHOLE patch
     # fails to apply, not just that one file's.
     # For this reason, use two independent fields, so agent and eval run against genuinely
-    # separate container instances.
+    # separate mounts.
     copy_out_mount_args: List[str] = Field(default_factory=list)
     eval_copy_out_mount_args: List[str] = Field(default_factory=list)
     eval_dir_in_openhands: str
@@ -456,6 +437,7 @@ class SweBenchDatasetProcessor(BaseDatasetHarnessProcessor):
 
             if swebench_dir.exists():
                 print(f"SWE-bench already set up at {setup_dir}")
+                self._ensure_swebench_image(swebench_dir, setup_dir / "swebench.img", force=False)
                 return setup_dir
 
             print(f"Setting up SWE-bench environment at {setup_dir}...", flush=True)
@@ -469,7 +451,22 @@ SWEBENCH_COMMIT={swebench_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
+            # force=True: swebench_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_swebench_image(swebench_dir, setup_dir / "swebench.img", force=True)
             return setup_dir
+
+    def _ensure_swebench_image(self, swebench_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over swebench_dir/venv -- see
+        scripts/vm/build_swebench_image.sh and OpenHandsHarnessProcessor._ensure_openhands_image
+        (same pattern, imaged here mainly for consistency/concurrency headroom across all
+        dataset venvs rather than a confirmed stall -- see build_swebench_image.sh's header)."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_swebench_image.sh"
+        logger.info("Building SWE-bench block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {swebench_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         swebench_cmd = (
@@ -600,6 +597,7 @@ class R2EGymDatasetProcessor(BaseDatasetHarnessProcessor):
                 result = subprocess_run([str(python_bin), "-c", "import r2egym"])
                 if result.returncode == 0:
                     print(f"R2E-Gym already set up at {setup_dir}", flush=True)
+                    self._ensure_r2e_gym_image(r2e_gym_dir, setup_dir / "r2e_gym.img", force=False)
                     return setup_dir
 
                 print("R2E-Gym directory exists but module not properly installed, rebuilding...", flush=True)
@@ -617,7 +615,20 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
+            # force=True: r2e_gym_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_r2e_gym_image(r2e_gym_dir, setup_dir / "r2e_gym.img", force=True)
             return setup_dir
+
+    def _ensure_r2e_gym_image(self, r2e_gym_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over r2e_gym_dir/venv -- see scripts/vm/build_r2e_gym_image.sh
+        and OpenHandsHarnessProcessor._ensure_openhands_image for the general pattern."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_r2e_gym_image.sh"
+        logger.info("Building R2E-Gym block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {r2e_gym_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         instance_dict = json.loads(self.config.problem_info["instance_dict"])
@@ -701,6 +712,7 @@ class SWESmithDatasetProcessor(BaseDatasetHarnessProcessor):
                 result = subprocess_run([str(python_bin), "-c", "from swesmith.profiles import registry"])
                 if result.returncode == 0:
                     print(f"SWE-smith already set up at {setup_dir}", flush=True)
+                    self._ensure_swesmith_image(swesmith_dir, setup_dir / "swesmith.img", force=False)
                     return setup_dir
 
                 print("SWE-smith directory exists but module not properly installed, rebuilding...", flush=True)
@@ -725,7 +737,22 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
             # R2E-Gym/SWE-bench's own setup dirs).
             shutil.copy(driver_src, driver_dst)
 
+            # force=True: swesmith_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_swesmith_image(swesmith_dir, setup_dir / "swesmith.img", force=True)
             return setup_dir
+
+    def _ensure_swesmith_image(self, swesmith_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over swesmith_dir/venv -- see scripts/vm/build_swesmith_image.sh
+        and OpenHandsHarnessProcessor._ensure_openhands_image (same pattern, imaged here mainly
+        for consistency/concurrency headroom across all dataset venvs rather than a confirmed
+        stall -- see build_swesmith_image.sh's header)."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_swesmith_image.sh"
+        logger.info("Building SWE-smith block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {swesmith_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         swesmith_cmd = (
@@ -984,11 +1011,10 @@ REBENCH_DIR={rebench_dir} \
 
         # [CUSTOM-SWEREBENCH-V1-EVAL-CD-FIX 2026-10-16] This eval command is shared by both V1
         # (plain "SWE-rebench") and V2 ("SWE-rebench-V2"), but `cd /{repo_name}` below is only
-        # correct for V2 -- its own _copy_out_writable_paths branch mounts content at exactly
-        # that path (see `copy_paths = [f"/{repo_name}"]`, the shared-mirror design). V1's own
-        # _copy_out_writable_paths branch (CUSTOM-SWEREBENCH-V1-WORKSPACE) never mounts anything
-        # at /{repo_name} at all -- V1's content lives at /testbed (and is separately bind-mounted
-        # onto /workspace/<repo>__<version> for agent mode only).
+        # correct for V2 -- V2's per-instance images check the repo out at exactly that path.
+        # V1's content lives at /testbed instead (and is separately `cp -a`'d to
+        # /workspace/<repo>__<version> for both modes, see _build_apptainer_command's
+        # CUSTOM-VM-SIDECAR SWE-rebench branch).
         eval_cd_target = (
             f"/{repo_name}" if self.config.problem_info["dataset_name"] == "SWE-rebench-V2" else "/testbed"
         )
@@ -1343,6 +1369,7 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
                 )
                 if result.returncode == 0:
                     print(f"OpenHands already set up at {setup_dir}", flush=True)
+                    self._ensure_openhands_image(openhands_dir, setup_dir / "openhands.img", force=False)
                     return setup_dir
 
                 print(
@@ -1387,7 +1414,26 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
                 f"-- refusing to proceed with a known-broken venv. Import error was:\n{result.stderr}"
             )
 
+            # force=True: openhands_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_openhands_image(openhands_dir, setup_dir / "openhands.img", force=True)
             return setup_dir
+
+    def _ensure_openhands_image(self, openhands_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-27] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over openhands_dir -- see scripts/vm/build_openhands_image.sh
+        and nemo_gym/vm_launcher.py's block_device_mounts. Called from both setup() return
+        points, under the same per-setup-dir lock that guards openhands_dir itself, so the image
+        can never observe a half-written openhands_dir and can never silently diverge from it:
+        whenever openhands_dir is freshly rebuilt (force=True) the image is unconditionally
+        rebuilt alongside it; on the fast/cached "already set up" path (force=False) the image
+        is left alone if it already exists, since nothing about openhands_dir changed.
+        """
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_openhands_image.sh"
+        logger.info("Building OpenHands block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {openhands_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         data_point = self.config.problem_info
@@ -1728,7 +1774,51 @@ class RunOpenHandsAgent(BaseModel):
         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
         log_file = open(log_file_path, "w")
 
-        process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
+        dataset_name = self.config.problem_info.get("dataset_name")
+        if _uses_vm_sidecar(dataset_name):
+            # [CUSTOM-VM-SIDECAR 2026-10-27] Route through this node's persistent VM sidecar
+            # instead of running the apptainer command directly on the host -- see
+            # nemo_gym/vm_launcher.py's.
+            #
+            # ensure_vm() is a blocking call (subprocess/file-lock based, like
+            # sandbox_launcher.ensure_sandbox()) -- safe to call directly here despite this
+            # being an async method because each rollout is its own Ray task running
+            # asyncio.run() in its own process; there is no other concurrent coroutine sharing
+            # this event loop for a blocking call to stall.
+            #
+            # Do a passthrough of HTTP_PROXY/HTTPS_PROXY (SSH does not punch through
+            # arbitrary environment variables by default).
+            proxy_env = {
+                var: os.environ[var]
+                for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+                if os.environ.get(var)
+            }
+            # [CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Every dataset harness's own venv is imaged
+            # as a dedicated read-only block device: these can be though of as basically 
+            # "pre-compiled disks" that are attached to the VM and contain all the files needed
+            # for the harness to work.
+            # Each image shadows ONLY its venv/.venv dir, NOT the whole setup dir.
+            openhands_dir = f"{self.config.openhands_setup_dir}/OpenHands"
+            openhands_image = f"{self.config.openhands_setup_dir}/openhands.img"
+            swebench_dir = f"{self.config.swebench_setup_dir}/SWE-bench"
+            swebench_image = f"{self.config.swebench_setup_dir}/swebench.img"
+            r2e_gym_dir = f"{self.config.r2e_gym_setup_dir}/R2E-Gym"
+            r2e_gym_image = f"{self.config.r2e_gym_setup_dir}/r2e_gym.img"
+            swesmith_dir = f"{self.config.swesmith_setup_dir}/SWE-smith"
+            swesmith_image = f"{self.config.swesmith_setup_dir}/swesmith.img"
+            vm_info = ensure_vm(
+                golden_image_dir=self.config.vm_golden_image_dir,
+                lustre_share_roots=self.config.vm_lustre_share_roots,
+                block_device_mounts=[
+                    (openhands_image, f"{openhands_dir}/.venv"),
+                    (swebench_image, f"{swebench_dir}/venv"),
+                    (r2e_gym_image, f"{r2e_gym_dir}/venv"),
+                    (swesmith_image, f"{swesmith_dir}/venv"),
+                ],
+            )
+            process = await run_in_vm(vm_info, apptainer_cmd, env=proxy_env, stdout=log_file, stderr=log_file)
+        else:
+            process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
 
         return ActiveContainerCommand(process=process, log_file=log_file, log_file_path=log_file_path)
 
@@ -1784,9 +1874,7 @@ class RunOpenHandsAgent(BaseModel):
             )
 
     async def _kill_active_command(self, active_command: ActiveContainerCommand) -> None:
-        if active_command.process.returncode is None:
-            active_command.process.kill()
-            await active_command.process.wait()
+        await _kill_and_reap_process(active_command.process, context=f"container command for {self.config.instance_id}")
         active_command.log_file.close()
 
     async def process_single_datapoint(self) -> Optional[Path]:
@@ -2065,286 +2153,28 @@ async def _kill_and_reap_process(process: asyncio.subprocess.Process, context: s
         return False
 
 
-async def _run_chmod_best_effort(args: list[str], context: str, timeout_seconds: float = 120.0) -> None:
-    """Best-effort `chmod` cleanup used between copy-out retries / after a successful copy-out.
-
-    Never raises: a stuck or failed chmod here would otherwise either hang the caller forever
-    (same D-state risk as the main copy-out, see [CUSTOM-COPYOUT-DSTATE-REAP] above -- this
-    helper previously had NO timeout protection at all) or abort a rollout over a step whose
-    only purpose is to unblock a *subsequent* retry/mount. Logs and moves on either way.
-    """
-    process = await asyncio.create_subprocess_exec(
-        "chmod", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+# [CUSTOM-VM-SIDECAR 2026-10-27] Which dataset types need the per-node VM sidecar (real root,
+# no --fakeroot) instead of running the apptainer command directly on the host -- see
+# nemo_gym/vm_launcher.py. Exactly the five dataset types that used to call
+# _copy_out_writable_paths for a writable /testbed or /{repo_name}; everything else (Harbor,
+# plain SWE-bench, SWE-bench_Multilingual, nv-internal-1, swe-bench-ext) never hit the
+# root-owned-path problem in the first place and keeps running on the bare host. Module-level
+# (not a method) because it's needed from both SWEBenchWrapper (_build_apptainer_command) and
+# RunOpenHandsAgent (_start_container_command), two different classes in this file.
+def _uses_vm_sidecar(dataset_name: Optional[str]) -> bool:
+    dataset_name = dataset_name or ""
+    return (
+        "SWE-Gym" in dataset_name
+        or "R2E-Gym" in dataset_name
+        or "SWE-smith" in dataset_name
+        or "SWE-rebench" in dataset_name  # covers both V1 and V2
     )
-    try:
-        await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        await _kill_and_reap_process(process, context=context)
-
-
-async def _run_copyout_cp(
-    apptainer_binary: str,
-    mount_src: Path,
-    container: str,
-    src_in_container: str,
-    semaphore: Semaphore,
-    max_attempts: int = 5,
-    base_backoff_seconds: float = 1.0,
-    timeout_seconds: float = 600.0,
-) -> tuple[int, str]:
-    """Runs `<apptainer_binary> exec ... cp -a <src_in_container> /mnt/`, retrying on
-    transient failures (NOT on `cp`'s own failures, e.g. a path genuinely missing in this
-    image -- those return immediately, unchanged).
-
-    [CUSTOM-COPYOUT-RETRY 2026-10-22] High per-rollout concurrency (hundreds of simultaneous
-    `apptainer exec` calls on one compute node, one per copy-out) can exhaust the node's finite
-    pool of kernel loop devices. In such a case, many fail with "FATAL: container creation
-    failed: ... could not attach image file to loop device: no loop devices available".
-    In this case the mount is silently skipped, leaving the rollout running directly against
-    the original READ-ONLY, root-owned image instead of the writable copy -- producing a
-    `git reset --hard: Permission denied` cascade deep inside OpenHands, with nothing pointing
-    back at the real, upstream cause.
-    For this reason, a `semaphore` (default size 100) bounds how many of these
-    `apptainer exec` calls run at once. On top of that, a jittered backoff-retry handles any
-    transient failures that still get through.
-
-    [CUSTOM-COPYOUT-IO-RETRY 2026-10-22] Separately, `cp` itself can report
-    "error reading '<path>': Input/output error" on large per-instance images under read
-    pressure -- a different, random/transient failure (a different file fails each retry, a
-    direct re-read of the "failed" file succeeds immediately, `git fsck` finds no actual
-    corruption), not an image problem. Retrying the whole copy like any other transient
-    failure resolves it; this is NOT in `_COPYOUT_SAFE_TO_SKIP_PATTERNS` because the content
-    involved (e.g. git packfiles, compiled binaries) is real and needed, not a disposable
-    build cache -- so it must never be silently tolerated, only retried.
-
-    [CUSTOM-COPYOUT-RETRY-CLOBBER 2026-10-22] A retry re-runs the full `cp -a` into the SAME
-    destination, which can already hold files `cp` copied successfully before failing partway
-    through the prior attempt. `cp -a` preserves source permissions, so a read-only source file
-    (e.g. a git packfile, usually 0444) lands read-only on the host too -- and a bare retry then
-    fails trying to overwrite its own earlier output: "cannot create regular file '<path>':
-    Permission denied", a self-inflicted failure, not a real one. Fix: before retrying, make the
-    whole destination recursively writable so `cp -a` can freely overwrite/continue.
-
-    [CUSTOM-COPYOUT-TIMEOUT 2026-10-23] Unlike the two failure modes above, a degraded node's
-    filesystem/I/O path can make `cp -a` hang indefinitely instead of exiting with any error
-    at all. `timeout_seconds` bounds each attempt; a hang past it is killed and treated as
-    transient (retried like any other), so a bad node degrades one rollout's latency instead
-    of silently stalling the whole job forever.
-    """
-    returncode, stderr_text = 1, ""
-    # [CUSTOM-COPYOUT-TIMING 2026-10-25] No visibility into how long any of this actually takes
-    # in production -- when a step stalls for hours, there's no way to tell whether it's many
-    # individually-slow copy-outs or something else without this. Logs per-attempt and total
-    # elapsed time, keyed by the container/image and the in-container path being copied.
-    op_start = time.time()
-    for attempt in range(1, max_attempts + 1):
-        attempt_start = time.time()
-        async with semaphore:
-            process = await asyncio.create_subprocess_exec(
-                apptainer_binary,
-                "exec",
-                "--containall",
-                "--cleanenv",
-                "--mount",
-                f"type=bind,src={mount_src},dst=/mnt",
-                container,
-                "cp",
-                "-a",
-                "--",
-                src_in_container,
-                "/mnt/",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-                returncode = process.returncode
-            except asyncio.TimeoutError:
-                await _kill_and_reap_process(process, context=f"copy-out cp -a of {src_in_container} from {container}")
-                returncode = 255
-                stderr_text = (
-                    f"FATAL: copy-out hung past {timeout_seconds:.0f}s timeout (killed) -- "
-                    "likely a degraded node filesystem/I/O path, not a container-creation issue"
-                )
-                if attempt < max_attempts:
-                    print(
-                        f"WARNING: copy-out of {src_in_container} from {container} timed out "
-                        f"(attempt {attempt}/{max_attempts}, {time.time() - attempt_start:.1f}s this "
-                        f"attempt, treating as transient -- retrying): {stderr_text}",
-                        flush=True,
-                    )
-                    # [CUSTOM-COPYOUT-RETRY-CLOBBER 2026-10-22] same clobber risk as any other
-                    # retry: the killed `cp -a` may have left partially-copied read-only files.
-                    await _run_chmod_best_effort(
-                        ["-R", "u+w", str(mount_src)], context=f"post-timeout chmod of {mount_src}"
-                    )
-                    await asyncio.sleep(random.uniform(0, base_backoff_seconds * (2 ** (attempt - 1))))
-                continue
-        if returncode == 0:
-            print(
-                f"INFO: copy-out of {src_in_container} from {container} succeeded in "
-                f"{time.time() - op_start:.1f}s total ({attempt} attempt(s))",
-                flush=True,
-            )
-            return 0, ""
-        stderr_text = stderr.decode(errors="replace")
-        is_transient_failure = returncode == 255 or "FATAL" in stderr_text or "Input/output error" in stderr_text
-        if not is_transient_failure:
-            print(
-                f"WARNING: copy-out of {src_in_container} from {container} failed non-transiently "
-                f"after {time.time() - op_start:.1f}s ({attempt} attempt(s)): {stderr_text}",
-                flush=True,
-            )
-            return returncode, stderr_text
-        if attempt < max_attempts:
-            # Add exponential backoff (base_backoff_seconds * 2**(attempt-1) plus random
-            # jitter.
-            max_backoff = base_backoff_seconds * (2 ** (attempt - 1))
-            backoff = random.uniform(0, max_backoff)
-            print(
-                f"WARNING: copy-out of {src_in_container} from {container} failed (attempt "
-                f"{attempt}/{max_attempts}, {time.time() - attempt_start:.1f}s this attempt, looks "
-                f"like a transient failure -- retrying in {backoff:.1f}s): {stderr_text}",
-                flush=True,
-            )
-            # [CUSTOM-COPYOUT-RETRY-CLOBBER 2026-10-22] see docstring above -- host-side chmod
-            # (no container involved, mount_src is already our own host directory) so the next
-            # `cp -a` can overwrite any read-only leftovers from this failed attempt.
-            await _run_chmod_best_effort(["-R", "u+w", str(mount_src)], context=f"post-failure chmod of {mount_src}")
-            await asyncio.sleep(backoff)
-    print(
-        f"WARNING: copy-out of {src_in_container} from {container} exhausted all {max_attempts} "
-        f"attempts after {time.time() - op_start:.1f}s total: {stderr_text}",
-        flush=True,
-    )
-    return returncode, stderr_text
-
-
-# [CUSTOM-COPYOUT-PARTIAL-COPY 2026-10-22] Matched against each individual failed path reported
-# in `cp -a`'s own stderr (one "cp: cannot <verb> '<path>'" line per unreadable source file).
-# Every entry here is a compiler/package-manager-internal incremental/resume cache -- none of
-# these tools need their own cache to survive a copy, they regenerate it from scratch if
-# missing. A partial copy is tolerated ONLY if every failed path matches at least one of these
-# (see `_copyout_failures_are_all_safe_to_skip` below); anything else still hard-fails, so an
-# unexpected/unrecognized failure (e.g. a genuinely-needed source file) is never silently
-# papered over just because something ELSE in the same copy happened to be a known-safe cache
-# miss.
-_COPYOUT_SAFE_TO_SKIP_PATTERNS = [
-    re.compile(r"/target/(?:[^/]+/)*?(?:debug|release)/incremental/"),  # Rust/Cargo (1292 occurrences)
-    re.compile(r"/node_modules/.*/node-compile-cache/"),  # Node.js V8 compile cache (1775 occurrences)
-    re.compile(r"/node_modules/.*/\.tmp/"),  # broader node_modules scratch dir (superset of above)
-    re.compile(r"(^|/)\.gradle(/|$)"),  # Gradle's own cache dir (9 occurrences)
-    re.compile(r"/build/(?:cache|tmp)/"),  # Gradle/generic build-tool scratch (23 occurrences)
-    re.compile(r"/zinc/|compileScala\.analysis$|/target/scala-[\d.]+/"),  # sbt/Scala Zinc (56 occurrences)
-    # A nested repo's own immutable, content-addressed git object store (4 occurrences, seen in
-    # SWE-smith test fixtures under tests/fixtures/.../.git/objects/) -- git never rewrites an
-    # existing object, only adds new ones, so a missing/unreadable existing object can't corrupt
-    # anything the agent or eval harness does with that nested repo.
-    re.compile(r"\.git/objects/"),
-    # [CUSTOM-COPYOUT-ALLOWLIST 2026-10-23] contentsquare/chproxy's own Go test scratch dirs
-    # (cache/async_cache_test.go's asyncTestDir, proxy_test.go's testCacheDir).The tests own
-    # this directory's full lifecycle and recreate it fresh regardless of what a copy-out preserves.
-    re.compile(r"(^|/)(async-test-data|test-cache-data)(/|$)"),
-]
-
-_CP_FAILED_PATH_RE = re.compile(r"cp: cannot [a-z ]+ '([^']+)'")
-
-
-def _copyout_failures_are_all_safe_to_skip(stderr_text: str) -> bool:
-    """True iff every path `cp -a` reported as failed (in its own stderr) matches a known-safe,
-    irrelevant build-cache pattern -- see `_COPYOUT_SAFE_TO_SKIP_PATTERNS` above. Returns False
-    (never tolerate) if stderr doesn't contain any recognizable "cp: cannot ... '<path>'" line at
-    all, since that means we can't actually confirm what failed -- an empty/unparseable stderr
-    must never be treated as vacuously safe.
-    """
-    failed_paths = _CP_FAILED_PATH_RE.findall(stderr_text)
-    if not failed_paths:
-        return False
-    return all(any(pattern.search(path) for pattern in _COPYOUT_SAFE_TO_SKIP_PATTERNS) for path in failed_paths)
-
-
-# [CUSTOM-COPYOUT-PRUNE-RUST-INCREMENTAL 2026-10-25] `_COPYOUT_SAFE_TO_SKIP_PATTERNS` already
-# proves this exact directory shape is common enough to warrant its own regex (1292 occurrences
-# logged as "cp: cannot ..." failures) -- but that mechanism is purely reactive: it tolerates the
-# failure *after* `cp -a` already spent time walking into a potentially huge, many-small-file
-# Rust incremental-compilation cache. Deleting it before the copy-out removes the slow
-# walk/copy entirely instead of merely tolerating the errors afterward. Scoped narrowly to the
-# Rust pattern only, NOT generalized to the other four patterns in `_COPYOUT_SAFE_TO_SKIP_PATTERNS`
-# (node_modules/Gradle/sbt/git-objects).
-async def _prune_rust_incremental_cache(
-    apptainer_binary: str,
-    container: str,
-    src_in_container: str,
-    semaphore: Semaphore,
-    timeout_seconds: float = 60.0,
-) -> None:
-    """Best-effort: delete target/{debug,release}/incremental/ under `src_in_container` inside
-    `container`, before a copy-out walks it. Never raises -- a failure here (prune command itself
-    errors, times out, or the path doesn't exist) just means the subsequent `cp -a` falls back to
-    its existing slow-but-correct behavior, so this is purely an optimization, never a
-    correctness dependency.
-    """
-    # Same reasoning as CUSTOM-COPYOUT-TIMING on _run_copyout_cp -- need per-op timing
-    # tied to the container to tell apart "this instance's prune is itself slow" from
-    # "the subsequent cp -a is the slow part".
-    op_start = time.time()
-    async with semaphore:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                apptainer_binary,
-                "exec",
-                "--containall",
-                "--cleanenv",
-                container,
-                "find",
-                src_in_container,
-                "-mindepth",
-                "1",
-                "-type",
-                "d",
-                "-path",
-                "*/target/*/incremental",
-                "-prune",
-                "-exec",
-                "rm",
-                "-rf",
-                "{}",
-                "+",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-            print(
-                f"INFO: prune of {src_in_container} in {container} succeeded in "
-                f"{time.time() - op_start:.1f}s",
-                flush=True,
-            )
-        except asyncio.TimeoutError as e:
-            # [CUSTOM-COPYOUT-DSTATE-REAP 2026-10-26] previously left `process` running
-            # unkilled on timeout -- same D-state leak risk as the main copy-out, just silent
-            # since this prune is already non-fatal to the caller either way.
-            await _kill_and_reap_process(process, context=f"prune of {src_in_container} in {container}")
-            print(
-                f"WARNING: pruning Rust incremental cache under {src_in_container} in {container} "
-                f"failed after {time.time() - op_start:.1f}s (non-fatal, falling back to copying it "
-                f"as-is): {type(e).__name__}: {e}",
-                flush=True,
-            )
-        except Exception as e:
-            print(
-                f"WARNING: pruning Rust incremental cache under {src_in_container} in {container} "
-                f"failed after {time.time() - op_start:.1f}s (non-fatal, falling back to copying it "
-                f"as-is): {type(e).__name__}: {e}",
-                flush=True,
-            )
 
 
 class SWEBenchWrapper(SimpleResponsesAPIAgent):
     config: SWEBenchWrapperConfig
 
     _sem: Optional[Semaphore] = None
-    # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] see SWEBenchWrapperConfig.copyout_concurrency
-    _copyout_sem: Optional[Semaphore] = None
     _vllm_converter: Optional[VLLMConverter] = None
     _swe_bench_wrapper_server_config: Optional[SWEBenchWrapperServerConfig] = None
 
@@ -2371,8 +2201,6 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         )
 
         self._sem = Semaphore(self.config.concurrency)
-        # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] see SWEBenchWrapperConfig.copyout_concurrency.
-        self._copyout_sem = Semaphore(self.config.copyout_concurrency)
         self._vllm_converter = VLLMConverter(return_token_id_information=True)
 
         return super().model_post_init(context)
@@ -2622,273 +2450,27 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f"Searched in paths: {tried_paths}."
         )
 
-    # [CUSTOM 2026-10-08] SWE-Gym/R2E-Gym images are built with root-owned content, so running
-    # rootless (no --fakeroot) leaves those paths non-writable even under --writable-tmpfs --
-    # symptom: `git reset --hard`/test setup under /testbed fails with "Permission denied".
-    # Baking a chmod into the image at build time didn't scale (too slow over thousands of
-    # instances), so the fix moved here instead: per rollout, copy the needed path(s) out of the
-    # (untouched) .sif into a scratch dir via a throwaway `apptainer exec` -- unprivileged
-    # extraction makes the copy host-UID-owned -- chmod it, then bind-mount the writable copy
-    # back over the same path in the real container.
-    #
-    # R2E-Gym needs a wider scope than SWE-Gym: SWE-Gym's /testbed is mostly writable already,
-    # but R2E-Gym's is root-owned almost entirely, and it also has a separate top-level
-    # /r2e_tests holding the held-out eval tests. /r2e_tests is a HIDE path, not a copy path:
-    # it must stay invisible to the agent, so we bind an empty writable dir over it instead of
-    # copying its real content out.
-    #
-    # Scope: SWE-Gym, R2E-Gym, SWE-smith. Other dataset types on this agent keep their prior
-    # (no mount) behavior unless called out in their own branch below.
-    async def _copy_out_writable_paths(
-        self, container: str, problem_info: Dict[str, Any], persistent_dir: Path, mode: str
+    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym, R2E-Gym, SWE-smith, SWE-rebench-V1, and
+    # SWE-rebench-V2 now run their apptainer command inside the per-node VM sidecar as
+    # real root (see nemo_gym/vm_launcher.py and _uses_vm_sidecar below), so those paths
+    # are directly writable. 
+    # One small quirk: R2E-Gym's held-out tests (/r2e_tests) must stay invisible to the
+    # AGENT, so do an explicit empty-dir bind mount in agent mode.
+    def _vm_task_integrity_mount_args(
+        self, problem_info: Dict[str, Any], persistent_dir: Path, mode: str
     ) -> List[str]:
-        # [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] `mode` ("agent" or "eval") scopes the
-        # destination directory so agent and eval each get their own fresh copy -- sharing one
-        # copy between them is a bug (eval needs real held-out tests the agent must never see.
         dataset_name = problem_info.get("dataset_name", "") or ""
-        if "R2E-Gym" in dataset_name:
-            # [CUSTOM-R2EGYM-EVAL-ROOT-PERMISSION 2026-10-11] eval-mode only. R2E-Gym's eval
-            # harness writes into /root (symlinking the venv, moving run_tests.sh and
-            # /r2e_tests there) before running tests. /root is root-owned and not even readable
-            # by our unprivileged UID, so every one of those writes fails with Permission
-            # denied, run_tests.sh never lands, and eval scores 0 regardless of patch
-            # correctness. Fix: give eval a fresh writable (empty) /root to write into.
-            #
-            # Separately, /r2e_tests holds the real held-out tests and IS readable in the image,
-            # but was being wiped to an empty dir by hide_paths in eval mode too (hide_paths
-            # wasn't mode-gated before) -- eval needs the real content, only the agent needs it
-            # hidden.
-            #
-            # [CUSTOM-R2EGYM-EVAL-DOCKER-VS-SINGULARITY 2026-10-11] Can't just add /r2e_tests as
-            # a normal copy_paths mount: the harness's own setup does `mv /r2e_tests
-            # {alt_path}/r2e_tests` then `ln -s {alt_path}/r2e_tests {repo_path}/r2e_tests` --
-            # written for Docker's unified overlay, but under Singularity each top-level
-            # directory is its own mount point, so the `mv` fails with "Device or resource
-            # busy" regardless of what we bind there. The `ln -s` still runs afterward
-            # unconditionally, so pre-binding real content at /testbed/r2e_tests makes it nest a
-            # stray symlink inside that directory instead of creating the symlink itself,
-            # silently losing the test files. Fix: pre-populate /root/r2e_tests directly (under
-            # the writable /root scratch dir below) and leave /testbed/r2e_tests untouched --
-            # the `ln -s` then creates the correct symlink on its own.
-            if mode == "eval":
-                copy_paths = ["/testbed"]
-                hide_paths = ["/root"]
-            else:
-                copy_paths = ["/testbed"]
-                hide_paths = ["/r2e_tests"]
-        elif "SWE-Gym" in dataset_name:
-            copy_paths = ["/testbed"]
-            hide_paths = []
-        elif "SWE-smith" in dataset_name:
-            # Same root-owned /testbed pattern as SWE-Gym (git reset --hard/touch fail with
-            # Permission denied otherwise), fixed by the same copy-out mechanism. Compiled-
-            # language repos can ship a large build cache under /testbed (e.g. Rust's target/)
-            # that occasionally hits a single-file I/O error during the copy -- non-fatal, the
-            # rest of the copy and the subsequent git/write operations still succeed, so left
-            # as-is rather than special-casing per-language build dirs.
-            copy_paths = ["/testbed"]
-            hide_paths = []
-        elif dataset_name == "SWE-rebench-V2":
-            # [CUSTOM-SWEREBENCH-V2 2026-10-14] Uses per-instance images (see
-            # _find_container's SWE-rebench-V2 branch), repo already checked out under
-            # /{repo_name} -- same root-owned-path problem as R2E-Gym/SWE-Gym/SWE-smith, so it
-            # joins their existing copy-out path instead of needing a bespoke mechanism.
-            instance_dict = json.loads(problem_info["instance_dict"])
-            repo = instance_dict.get("repo", "")
-            repo_name = repo.split("/")[1] if "/" in repo else repo
-            copy_paths = [f"/{repo_name}"]
-            hide_paths = []
-        elif "SWE-rebench" in dataset_name:
-            # [CUSTOM-SWEREBENCH-V1 2026-10-14] V1 ("SWE-rebench", distinct from the V2 branch
-            # above) uses real per-instance images with the same root-owned-/testbed problem as
-            # SWE-Gym/R2E-Gym, so it joins their copy-out path too.
-            #
-            # [CUSTOM-SWEREBENCH-V1-WORKSPACE 2026-10-14] Also bind the writable copy onto
-            # /workspace/<repo>__<version> (where OpenHands expects the repo for plain
-            # "SWE-rebench", unlike /testbed for the other datasets). OpenHands' own entry
-            # script normally populates that path itself via `cp -r /testbed /workspace/<name>`
-            # at rollout time, but that runs inside the container's small --writable-tmpfs
-            # overlay, and doubling the repo there blows it (ENOSPC), silently truncating files
-            # like .git/refs/remotes/origin/HEAD to 0 bytes. Fix: pre-populate
-            # /workspace/<name> ourselves via a second bind mount of the same host-side writable
-            # copy and skip the entry script's own copy (see SKIP_ENTRY_SCRIPT_TYPES in
-            # run_infer.py).
-            copy_paths = ["/testbed"]
-            hide_paths = []
+        if "R2E-Gym" in dataset_name and mode == "agent":
+            hide_paths = ["/r2e_tests"]
         else:
             return []
 
-        # [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] mode-scoped -- see top-of-function comment.
-        copy_root = persistent_dir / "writable_copy" / mode
+        hide_root = persistent_dir / "vm_hidden_paths" / mode
         mount_args: List[str] = []
-
-        for image_path in copy_paths:
-            dest = copy_root / image_path.lstrip("/")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # [CUSTOM-COPYOUT-PRUNE-RUST-INCREMENTAL 2026-10-25] see that function's own
-            # docstring -- best-effort, never blocks the actual copy-out below.
-            await _prune_rust_incremental_cache(
-                self.config.apptainer_binary,
-                container,
-                image_path,
-                self._copyout_sem,
-            )
-            returncode, stderr_text = await _run_copyout_cp(
-                self.config.apptainer_binary,
-                dest.parent,
-                container,
-                image_path,
-                self._copyout_sem,
-                timeout_seconds=self.config.copyout_timeout_seconds,
-            )
-            if returncode != 0:
-                if returncode == 255 or "FATAL" in stderr_text:
-                    # Exhausted retries on a real container-creation failure, raise
-                    raise RuntimeError(
-                        f"copy-out of {image_path} from {container} failed after retries "
-                        f"(transient container-creation contention never cleared): {stderr_text}"
-                    )
-                # [CUSTOM-COPYOUT-PARTIAL-COPY 2026-10-22] `cp -a` on a real content tree often
-                # fails on one or more unreadable build-cache/incremental-compilation files (see
-                # `_COPYOUT_SAFE_TO_SKIP_PATTERNS` above) while the rest of the tree copies fine.
-                # Treating any nonzero exit as "path missing, skip the mount" discarded the whole
-                # (mostly-good) copy and fell back to the original read-only image, which is why
-                # git writes (`.git/index.lock`, `git reset --hard`) failed with Permission
-                # denied even though a usable writable copy existed on disk.
-                # Fix: tell "nothing copied" apart from "copy mostly succeeded" apart from
-                # "a failure outside the allowlist".
-                dest_has_content = dest.exists() and any(dest.iterdir())
-                if not dest_has_content:
-                    # Best-effort: some images may not have every path in copy_paths. Skip the
-                    # mount for that path rather than fail the whole rollout over it.
-                    print(
-                        f"WARNING: copy-out of {image_path} from {container} failed, skipping its mount: "
-                        f"{stderr_text}",
-                        flush=True,
-                    )
-                    continue
-                if not _copyout_failures_are_all_safe_to_skip(stderr_text):
-                    raise RuntimeError(
-                        f"copy-out of {image_path} from {container} partially failed on an "
-                        f"unrecognized path (not in the known-safe build-cache allowlist) -- "
-                        f"refusing to silently proceed with a possibly-incomplete writable copy: "
-                        f"{stderr_text}"
-                    )
-                print(
-                    f"WARNING: copy-out of {image_path} from {container} partially failed (only "
-                    f"known-safe build-cache artifacts, see _COPYOUT_SAFE_TO_SKIP_PATTERNS) -- "
-                    f"using the partial writable copy anyway: {stderr_text}",
-                    flush=True,
-                )
-
-            await _run_chmod_best_effort(["-R", "a+rwX", str(dest)], context=f"post-copyout chmod of {dest}")
-
-            mount_args.append(f"--mount type=bind,src={dest},dst={image_path}")
-
-            # [CUSTOM-SWEREBENCH-V1-WORKSPACE 2026-10-14] see the V1 branch above -- second bind
-            # mount of the same host dir onto /workspace/<repo>__<version>, no extra copy.
-            if "SWE-rebench" in dataset_name and dataset_name != "SWE-rebench-V2" and image_path == "/testbed":
-                instance_dict = json.loads(problem_info["instance_dict"])
-                workspace_dir_name = f"{instance_dict.get('repo', '')}__{instance_dict.get('version', '')}".replace(
-                    "/", "__"
-                )
-                mount_args.append(f"--mount type=bind,src={dest},dst=/workspace/{workspace_dir_name}")
-
-        # [CUSTOM-R2EGYM-EVAL-VENV-PYTHON 2026-10-11] eval-mode only, R2E-Gym only. The eval
-        # harness invokes `.venv/bin/python` by relative path, but that symlink is baked at
-        # image-build time to an absolute path under root-owned /root -- unreadable to our
-        # unprivileged UID, so the symlink is permanently dangling (`run_tests.sh` fails with
-        # ".venv/bin/python: No such file or directory"). 
-        # Fix: relink `.venv/bin/python` to a real interpreter of the matching version, 
-        # pre-installed into the shared R2E-Gym setup dir during presync. 
-        # Best-effort: if that exact Python version was never installed, log a warning
-        # and leave the symlink dangling rather than failing the rollout.
-        if mode == "eval" and "R2E-Gym" in dataset_name:
-            venv_python = copy_root / "testbed" / ".venv" / "bin" / "python"
-            if venv_python.is_symlink():
-                target = os.readlink(venv_python)
-                match = re.search(r"cpython-(\d+\.\d+)\.\d+-linux-x86_64-gnu/bin/python\d+\.\d+$", target)
-                if match:
-                    version_major_minor = match.group(1)
-                    full_version_match = re.search(r"cpython-(\d+\.\d+\.\d+)-linux-x86_64-gnu", target)
-                    full_version = full_version_match.group(1) if full_version_match else None
-                    candidate = None
-                    if full_version:
-                        candidate = (
-                            Path(self._swe_bench_wrapper_server_config.r2e_gym_setup_dir)
-                            / "python"
-                            / f"cpython-{full_version}-linux-x86_64-gnu"
-                            / "bin"
-                            / f"python{version_major_minor}"
-                        )
-                    if candidate and candidate.exists():
-                        venv_python.unlink()
-                        venv_python.symlink_to(candidate)
-                    else:
-                        print(
-                            f"WARNING: R2E-Gym eval venv python for {container} targets missing/"
-                            f"inaccessible {target!r} (needs Python {full_version or version_major_minor}, "
-                            f"not available under "
-                            f"{self._swe_bench_wrapper_server_config.r2e_gym_setup_dir}/python) -- leaving "
-                            "dangling, eval test execution will likely fail for this rollout",
-                            flush=True,
-                        )
-
-        # [CUSTOM-R2EGYM-EVAL-DOCKER-VS-SINGULARITY 2026-10-11] eval-mode only, R2E-Gym only.
-        # See the long comment above this function's R2E-Gym branch for the full story: this
-        # pre-populates /root/r2e_tests (real held-out test content) BEFORE /root gets bound
-        # below, so setup_env()'s own `ln -s /root/r2e_tests /testbed/r2e_tests` creates a
-        # working symlink to real content instead of either an empty/hidden dir or a stray
-        # nested symlink.
-        if mode == "eval" and "R2E-Gym" in dataset_name:
-            root_dest = copy_root / "root"
-            r2e_tests_dest = root_dest / "r2e_tests"
-            r2e_tests_dest.mkdir(parents=True, exist_ok=True)
-            # [CUSTOM-R2EGYM-EVAL-ROOT-DATASET-MOUNT 2026-10-11] The generic dataset-mount step
-            # further down (`--mount type=bind,src={instance_dataset_path},dst=/root/dataset/
-            # data.jsonl`, shared across all dataset types, not R2E-Gym-specific) assumes /root/
-            # dataset/data.jsonl already exists as a bind-mount destination -- true on the
-            # pristine image, but not once /root becomes this fresh, empty writable scratch dir.
-            # Singularity requires bind-mount destinations to pre-exist (symptom: "destination
-            # /root/dataset/data.jsonl doesn't exist in container"), so create the same
-            # placeholder here, mirroring r2e_tests_dest above.
-            dataset_placeholder = root_dest / "dataset" / "data.jsonl"
-            dataset_placeholder.parent.mkdir(parents=True, exist_ok=True)
-            dataset_placeholder.touch(exist_ok=True)
-            # See _run_copyout_cp's docstring (CUSTOM-COPYOUT-RETRY) for why this retries on
-            # transient container-creation failures (e.g. loop-device exhaustion under high
-            # concurrency) before giving up.
-            # [CUSTOM-COPYOUT-SEMAPHORE 2026-10-22] self._copyout_sem bounds concurrent copy-out
-            # exec calls specifically -- see SWEBenchWrapperConfig.copyout_concurrency.
-            returncode, stderr_text = await _run_copyout_cp(
-                self.config.apptainer_binary,
-                r2e_tests_dest,
-                container,
-                "/r2e_tests/.",
-                self._copyout_sem,
-                timeout_seconds=self.config.copyout_timeout_seconds,
-            )
-            if returncode != 0:
-                if returncode == 255 or "FATAL" in stderr_text:
-                    raise RuntimeError(
-                        f"copy-out of /r2e_tests from {container} failed after retries "
-                        f"(transient container-creation contention never cleared): {stderr_text}"
-                    )
-                print(
-                    f"WARNING: copy-out of /r2e_tests from {container} into /root/r2e_tests failed, "
-                    f"eval will likely score 0 for this rollout: {stderr_text}",
-                    flush=True,
-                )
-            else:
-                await _run_chmod_best_effort(
-                    ["-R", "a+rwX", str(r2e_tests_dest)], context=f"post-copyout chmod of {r2e_tests_dest}"
-                )
-
         for image_path in hide_paths:
-            dest = copy_root / image_path.lstrip("/")
+            dest = hide_root / image_path.lstrip("/")
             dest.mkdir(parents=True, exist_ok=True)
             mount_args.append(f"--mount type=bind,src={dest},dst={image_path}")
-
         return mount_args
 
     def _build_apptainer_command(
@@ -2926,9 +2508,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 f"--mount type=bind,src={openhands_dir}/evaluation/oh,dst={openhands_dir}/evaluation/oh",
             ]
         )
-        # [CUSTOM-R2EGYM-EVAL-ROOT-DATASET-MOUNT 2026-10-11] The /root/dataset/data.jsonl mount
-        # used to live right here, in this static list. Moved further down, to AFTER the
-        # copy_out_mount_args extend (search this same tag below) -- see that comment for why.
+        # /root/dataset/data.jsonl is mounted near the end of this function (search for
+        # dataset_path_to_mount below), not here with the other base mounts.
 
         if params.resolved_user_prompt_template:
             mount_args.append(
@@ -2979,6 +2560,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # print(f"Mounting R2E-Gym setup directory from: {self.r2e_gym_setup_dir}", flush=True)
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst=/r2egym_setup")
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst={params.r2e_gym_setup_dir}")
+            container_commands.append("mkdir -p /root/r2e_tests && cp -a /r2e_tests/. /root/r2e_tests/ || true")
 
         if command.mode == "eval" and "SWE-smith" in data_point["dataset_name"]:
             # Mount the entire setup directory (venv + our own driver script, see
@@ -3017,17 +2599,28 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             mount_args.append(f"--mount type=bind,src={test_patch_path},dst=/root/test_patch.diff")
             mount_args.append(f"--mount type=bind,src={params.model_patch_path},dst=/root/patch.diff")
 
+        # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-rebench V1 (not V2) expects its repo checked out at
+        # /workspace/<repo>__<version>, not /testbed.
+        if "SWE-rebench" in data_point["dataset_name"] and data_point["dataset_name"] != "SWE-rebench-V2":
+            instance_dict = json.loads(data_point["instance_dict"])
+            workspace_dir_name = f"{instance_dict.get('repo', '')}__{instance_dict.get('version', '')}".replace(
+                "/", "__"
+            )
+            container_commands.append(
+                f"mkdir -p /workspace && cp -a /testbed /workspace/{workspace_dir_name} || true"
+            )
+
         if command.mode == "agent" and "R2E-Gym" in data_point["dataset_name"]:
             # Remove R2E-Gym test-related files.
             for root_dir in ["", "/root", "/testbed"]:
                 container_commands.append(
                     # /r2e_tests holds evaluation tests the agent should not see. `|| true`:
-                    # this rm fails either way -- root-owned/755 content gives "Permission
-                    # denied" when no copy-out mount exists at this path, or "Device or
-                    # resource busy" when _copy_out_writable_paths' writable bind-mount is
-                    # active there -- but in both cases the agent never sees real r2e_tests
-                    # content anyway, so let the step fail without aborting the rest of the
-                    # && chain instead of blocking the real agent command from ever running.
+                    # this rm fails either way -- "Device or resource busy" at the path
+                    # _vm_task_integrity_mount_args' empty-dir bind mount is active (/r2e_tests
+                    # itself), "No such file or directory" at the others -- but in all cases the
+                    # agent never sees real r2e_tests content anyway, so let the step fail
+                    # without aborting the rest of the && chain instead of blocking the real
+                    # agent command from ever running.
                     f"rm -rf {root_dir}/r2e_tests || true && "
                     # run_tests.sh launches the tests in /r2e_tests, so the agent should not see this either.
                     # We check that it contains the substring "r2e_tests"
@@ -3044,27 +2637,14 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         container_script_path = f"/container_scripts/{command.mode}_script.sh"
         mount_args.append(f"--mount type=bind,src={script_path},dst={container_script_path},ro")
 
-        # [CUSTOM 2026-10-08] see _copy_out_writable_paths -- papers over this container's
-        # root-owned, non-writable paths (/testbed, and for R2E-Gym /r2e_tests) with a
-        # per-rollout writable copy. Appended last so these mounts win over anything the image
-        # itself provides at the same destination.
-        #
-        # [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] Mode-specific: agent and eval now each get
-        # their OWN independently-sourced copy instead of sharing one, so the agent's own
-        # untracked scaffold files can no longer leak into eval's checkout and break
-        # `git apply` on the model's patch.
+        # [CUSTOM-VM-SIDECAR 2026-10-27] see _vm_task_integrity_mount_args -- only R2E-Gym
+        # agent-mode's /r2e_tests hide mount lands here. Mode-specific fields kept (agent
+        # and eval get independently-computed mounts) even though only one dataset/mode
+        # combination populates them today, to avoid agent/eval cross-contamination.
         mount_args.extend(
             params.eval_copy_out_mount_args if command.mode == "eval" else params.copy_out_mount_args
         )
 
-        # [CUSTOM-R2EGYM-EVAL-ROOT-DATASET-MOUNT 2026-10-11] Must come AFTER the copy_out extend
-        # above. Singularity validates --mount destinations in argument order against whatever
-        # the filesystem looks like at that point -- this mount's destination,
-        # /root/dataset/data.jsonl, is nested under /root, which R2E-Gym's eval-mode
-        # copy_out_mount_args (hide_paths=["/root"]) remaps to a fresh writable scratch dir.
-        # Listed before that remapping, Singularity validates it against the pristine image's
-        # /root (no dataset/ subdir there) and fails every time with "destination doesn't exist
-        # in container". No effect on other dataset types, since none of them remap /root.
         mount_args.append(f"--mount type=bind,src={dataset_path_to_mount},dst=/root/dataset/data.jsonl")
 
         mount_str = " ".join(mount_args)
@@ -3095,18 +2675,50 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # then hit "no space left on device" mid build/install. Fix: give every container a real
         # per-rollout home directory via `-H`, and a separate real scratch directory bound to
         # `$TMPDIR` for tools that write to `/tmp` instead of `$HOME`.
-        tmp_scratch_dir = params.persistent_dir / "tmp_scratch"
-        tmp_scratch_dir.mkdir(parents=True, exist_ok=True)
-        home_scratch_dir = params.persistent_dir / "home_scratch"
-        home_scratch_dir.mkdir(parents=True, exist_ok=True)
-        apptainer_cmd = (
-            f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
-            f"--no-mount tmp,bind-paths -H {home_scratch_dir} "
-            f"--mount type=bind,src={tmp_scratch_dir},dst=/tmp_scratch --env TMPDIR=/tmp_scratch "
-            f"{env_args}"
-            f"{mount_str} "
-            f" {params.container} bash {container_script_path}"
-        )
+        #
+        # VM-sidecar containers get a guest-local scratch/home dir under /var/tmp instead of the
+        # host-created, 9p-shared persistent_dir used below for the host-direct path: writes made
+        # as root inside the guest do not propagate real ownership back through the 9p share, so
+        # tools that check tmpdir ownership (e.g. pytest) fail against a 9p-backed path. /var/tmp
+        # is used rather than /tmp because the latter is RAM-backed (tmpfs) and shared by every
+        # concurrent rollout on the node. Nothing reclaims this directory automatically, so it is
+        # removed explicitly in the background after each rollout (see below).
+        uses_vm_sidecar = _uses_vm_sidecar(data_point["dataset_name"])
+        if uses_vm_sidecar:
+            guest_scratch_dir = f"/var/tmp/swe_agents_scratch/{params.persistent_dir.name}_{command.mode}"
+            guest_home_dir = f"{guest_scratch_dir}_home"
+            # Capture apptainer's real exit code into `_rc` before backgrounding the cleanup
+            # `rm -rf`: backgrounding as the script's last statement would otherwise reset `$?`
+            # to the backgrounding operator's own (always-0) status.
+            #
+            # `--contain` only gives `-H {guest_home_dir}` an implicit bind; `--env TMPDIR=...`
+            # does not get one, so guest_scratch_dir also needs its own explicit same-path bind
+            # mount to be visible inside the container.
+            apptainer_cmd = (
+                f"mkdir -p {guest_scratch_dir} {guest_home_dir} && "
+                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
+                f"--no-mount tmp,bind-paths -H {guest_home_dir} --env TMPDIR={guest_scratch_dir} "
+                f"--mount type=bind,src={guest_scratch_dir},dst={guest_scratch_dir} "
+                f"{env_args}"
+                f"{mount_str} "
+                f" {params.container} bash {container_script_path}"
+                f"; _rc=$?"
+                f"; nohup timeout 30 rm -rf {guest_scratch_dir} {guest_home_dir} >/dev/null 2>&1 "
+                f"& exit $_rc"
+            )
+        else:
+            tmp_scratch_dir = params.persistent_dir / "tmp_scratch"
+            tmp_scratch_dir.mkdir(parents=True, exist_ok=True)
+            home_scratch_dir = params.persistent_dir / "home_scratch"
+            home_scratch_dir.mkdir(parents=True, exist_ok=True)
+            apptainer_cmd = (
+                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
+                f"--no-mount tmp,bind-paths -H {home_scratch_dir} "
+                f"--mount type=bind,src={tmp_scratch_dir},dst=/tmp_scratch --env TMPDIR=/tmp_scratch "
+                f"{env_args}"
+                f"{mount_str} "
+                f" {params.container} bash {container_script_path}"
+            )
         memory_limit_mb = params.apptainer_memory_limit_mb
         if memory_limit_mb is not None and memory_limit_mb > 0:
             memory_limit_kb = int(memory_limit_mb) * 1024
@@ -3168,8 +2780,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # between agent and eval -- see SWEBenchWrapperInstanceConfig.copy_out_mount_args'
         # docstring for the bug this fixes (agent's own untracked scaffold files leaking into
         # eval's supposedly-clean checkout and breaking `git apply` on the model's patch).
-        copy_out_mount_args = await self._copy_out_writable_paths(container, problem_info, persistent_dir, "agent")
-        eval_copy_out_mount_args = await self._copy_out_writable_paths(container, problem_info, persistent_dir, "eval")
+        copy_out_mount_args = self._vm_task_integrity_mount_args(problem_info, persistent_dir, "agent")
+        eval_copy_out_mount_args = self._vm_task_integrity_mount_args(problem_info, persistent_dir, "eval")
 
         eval_dir_in_openhands = f"evaluation/oh/{agent_run_id}"
         openhands_config_file_path = f"/tmp/config_{agent_run_id}.toml"
