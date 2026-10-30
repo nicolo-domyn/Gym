@@ -15,6 +15,7 @@ import asyncio
 import glob
 import importlib.util
 import json
+import logging
 import os
 import random
 import re
@@ -31,7 +32,7 @@ from shutil import rmtree
 from subprocess import Popen
 from subprocess import run as subprocess_run
 from traceback import format_exc
-from typing import Any, Dict, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import ray
 import tomlkit
@@ -57,7 +58,11 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.profiling import Profiler
+from nemo_gym.vm_launcher import _VM_LIB_SH, ensure_vm, run_in_vm
 from responses_api_models.vllm_model.app import VLLMConverter, split_responses_input_output_items
+
+
+logger = logging.getLogger(__name__)
 
 
 ########################################
@@ -106,9 +111,46 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
         default="HEAD", description="Which commit to use when cloning the SWE-agent/OpenHands repo"
     )
     # Container configuration
-    container_formatter: str | list[str] = Field(
+    # [CUSTOM-CONTAINER-FORMATTER-DICT 2026-10-21] container_formatter is used in _find_container
+    # to match a row to the right container. Various possibilities depending on how
+    # container_formatter is passed in:
+    # - str -> applied across rows, with a default fallback if no matching container is found.
+    # - list[str] -> similar to str, but the first matching string is used. Same default fallback.
+    # - dict[stt, str] -> uses the `dataset_name` attribute of each row to map to a specific
+    #                     formatter string. In this case there is no default fallback: if a row
+    #                     cannot be assigned to an existing container, an error is raised.
+    container_formatter: str | list[str] | dict[str, str] = Field(
         default="docker://swebench/sweb.eval.x86_64.{instance_id}", description="Container path template"
     )
+
+    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2
+    # images are built with root-owned content. To circumvent this, run them from inside a VM,
+    # where we are root. 
+    # In detail,the  apptainer command is run inside a per-node QEMU/KVM VM sidecar (see
+    # nemo_gym/vm_launcher.py). We only create one persistent VM per node, shared across every
+    # rollout happening in that node -- see vm_launcher.py's module docstring for the full 
+    # lifecycle description of the VM.
+    vm_golden_image_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "[CUSTOM-VM-SIDECAR] Directory holding golden.qcow2 and the unprivileged QEMU "
+            "install. Required when a job's data includes any of "
+            "SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2 rows "
+            "-- see _uses_vm_sidecar()."
+        ),
+    )
+    vm_lustre_share_roots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "[CUSTOM-VM-SIDECAR] Host directories shared into the VM via virtio-9p at boot, at "
+            "the same absolute path, so the existing _build_apptainer_command mount strings "
+            "need no changes. Must cover every host path that command binds for the affected "
+            "dataset types: the container_formatter image directory/directories, "
+            "base_results_dir's root (persistent_dir lives under it), and the "
+            "openhands/swebench/r2e_gym/swe_rebench/swesmith setup dirs' root(s)."
+        ),
+    )
+
     swebench_tests_timeout: int = Field(default=30 * 60, description="Timeout for running tests (seconds)")
 
     swebench_agent_timeout: int = Field(default=45 * 60, description="Timeout for running the agent (seconds)")
@@ -117,7 +159,47 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
         default=32 * 1024, description="Memory limit for the apptainer container (MB)"
     )
 
+    apptainer_binary: str = Field(
+        default="apptainer",
+        description=(
+            "Binary name/path used to launch the agent/eval containers (default 'apptainer', "
+            "matches prior unconditional behavior). [CUSTOM] Set to 'singularity' on clusters "
+            "that ship SingularityPRO/Singularity but have no 'apptainer' binary on PATH -- "
+            "Apptainer and Singularity are CLI-compatible forks, so 'exec'/mount-flag syntax "
+            "is unaffected by which binary name is used."
+        ),
+    )
+
     command_exec_timeout: int = Field(default=5 * 60, description="Timeout for executing the command (seconds)")
+
+    # [CUSTOM-CONTEXT-OVERFLOW-PREFLIGHT 2026-10-11] generation context cap (ideally matches
+    # policy.max_total_sequence_length / policy.generation.vllm_cfg.max_model_len
+    # in the top-level NeMo-RL training YAML). NeMo-Gym's own config system does NOT carry
+    # this value. Threading it through explicitly here lets nemo_gym_client.py do a pre-flight
+    # token-budget check before ever sending a request to vLLM, instead of only discovering
+    # overflow via vLLM's own 400 rejection. Optional/defaults to None (no pre-flight check).
+    # don't set it yet.
+    max_model_len: Optional[int] = Field(
+        default=None,
+        description=(
+            "Real generation context cap (chars/tokens), matching policy.max_total_sequence_length. "
+            "When set, enables a pre-flight token-budget check in OpenHands' NemoGymClient before "
+            "sending each completion request, to fail a rollout cleanly. Dangerous since a failed"
+            "rollout gets a 0 reward via a synthetic `finish` call and is hard to detect."
+        ),
+    )
+
+    # [CUSTOM-CONTEXT-OVERFLOW-PREFLIGHT 2026-10-12] Fixed token headroom reserved below
+    # max_model_len.
+    preflight_headroom_tokens: int = Field(
+        default=16384,
+        description=(
+            "Token headroom reserved below max_model_len for the context-overflow pre-flight "
+            "check: a request is rejected before sending if current_tokens + this value would "
+            "exceed max_model_len. Covers both tokenizer-approximation error and minimum "
+            "generation room. Only used when max_model_len is set."
+        ),
+    )
 
     # Concurrency control
     concurrency: int = Field(default=256, description="Maximum number of concurrent SWE-bench runs")
@@ -169,6 +251,7 @@ class SWEBenchWrapperServerConfig(BaseModel):
     r2e_gym_setup_dir: Path
     swe_rebench_setup_dir: Path
     swebench_multilingual_setup_dir: Path
+    swesmith_setup_dir: Path
     run_session_id: str
     base_results_dir: Path
 
@@ -195,6 +278,15 @@ class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapper
     output_for_eval_path: Path
     model_patch_path: Path
     container: str
+    # The agent routinely creates untracked scaffold files during its own OpenHands session
+    # (e.g. `install.sh`, `test_sleep.py`) that would otherwise persist into a shared mount.
+    # When the model's own patch.diff later tries to recreate that same file as "new",
+    # `git apply` refuses with "already exists in working directory" and the WHOLE patch
+    # fails to apply, not just that one file's.
+    # For this reason, use two independent fields, so agent and eval run against genuinely
+    # separate mounts.
+    copy_out_mount_args: List[str] = Field(default_factory=list)
+    eval_copy_out_mount_args: List[str] = Field(default_factory=list)
     eval_dir_in_openhands: str
     openhands_config_file_path: str
     agent_script_path: Path
@@ -345,6 +437,7 @@ class SweBenchDatasetProcessor(BaseDatasetHarnessProcessor):
 
             if swebench_dir.exists():
                 print(f"SWE-bench already set up at {setup_dir}")
+                self._ensure_swebench_image(swebench_dir, setup_dir / "swebench.img", force=False)
                 return setup_dir
 
             print(f"Setting up SWE-bench environment at {setup_dir}...", flush=True)
@@ -358,7 +451,22 @@ SWEBENCH_COMMIT={swebench_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
+            # force=True: swebench_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_swebench_image(swebench_dir, setup_dir / "swebench.img", force=True)
             return setup_dir
+
+    def _ensure_swebench_image(self, swebench_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over swebench_dir/venv -- see
+        scripts/vm/build_swebench_image.sh and OpenHandsHarnessProcessor._ensure_openhands_image
+        (same pattern, imaged here mainly for consistency/concurrency headroom across all
+        dataset venvs rather than a confirmed stall -- see build_swebench_image.sh's header)."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_swebench_image.sh"
+        logger.info("Building SWE-bench block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {swebench_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         swebench_cmd = (
@@ -489,6 +597,7 @@ class R2EGymDatasetProcessor(BaseDatasetHarnessProcessor):
                 result = subprocess_run([str(python_bin), "-c", "import r2egym"])
                 if result.returncode == 0:
                     print(f"R2E-Gym already set up at {setup_dir}", flush=True)
+                    self._ensure_r2e_gym_image(r2e_gym_dir, setup_dir / "r2e_gym.img", force=False)
                     return setup_dir
 
                 print("R2E-Gym directory exists but module not properly installed, rebuilding...", flush=True)
@@ -506,12 +615,47 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
+            # force=True: r2e_gym_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_r2e_gym_image(r2e_gym_dir, setup_dir / "r2e_gym.img", force=True)
             return setup_dir
 
+    def _ensure_r2e_gym_image(self, r2e_gym_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over r2e_gym_dir/venv -- see scripts/vm/build_r2e_gym_image.sh
+        and OpenHandsHarnessProcessor._ensure_openhands_image for the general pattern."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_r2e_gym_image.sh"
+        logger.info("Building R2E-Gym block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {r2e_gym_dir} {image_path}")
+
     def get_run_command(self) -> ExecuteContainerCommandArgs:
+        instance_dict = json.loads(self.config.problem_info["instance_dict"])
+        base_commit = instance_dict.get("base_commit", "")
         r2e_gym_cmd = (
             f'date +"%s.%N" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpath} && '
             f"{self._get_command_sleep_until_predictions_file()} && "
+            # [CUSTOM-R2EGYM-EVAL-BASECOMMIT 2026-10-11] the vendored
+            # src/r2egym/agenthub/run/run_local_evaluation.py never resets /testbed 
+            # itself -- it applies the model's patch via a plain `git apply` against
+            # whatever commit the container already is on. Unlike agent mode, eval mode
+            # never invokes that harness at all, so /testbed was left at the base image's raw
+            # default checkout. To fix this, git checkout {base_commit}` under `cd /app`,
+            # just scoped to /testbed and run before.
+            # [CUSTOM-R2EGYM-EVAL-HOME 2026-10-11] Apptainer always injects $HOME as our real
+            # host home dir (e.g. /leonardo/home/userexternal/<user>), same gotcha already
+            # handled for agent mode (see OpenHandsHarnessProcessor.get_run_command's
+            # `export HOME=$(mktemp -d /tmp/oh_home.XXXXXX)`, a few hundred lines down).
+            # Same fix as agent mode, just scoped to this eval command instead.
+            # [CUSTOM-TMPDIR-SCRATCH 2026-10-19] Same fix as OpenHandsHarnessProcessor's identical
+            # pattern: `${TMPDIR:-/tmp}` picks up `_build_apptainer_command`'s real, Lustre-backed
+            # scratch dir instead of silently overwriting its `-H`-provided $HOME with a fresh dir
+            # back on the tiny 64MB overlay.
+            f"export HOME=$(mktemp -d \"${{TMPDIR:-/tmp}}/r2egym_eval_home.XXXXXX\") && "
+            f"cd /testbed && git config --global --add safe.directory '*' && "
+            f"git reset --hard && git checkout --detach "
+            f"$(git rev-parse --verify {base_commit}^{{commit}}) && "
             # Use mounted directory path for cd
             "cd /r2egym_setup/R2E-Gym && "
             # Set UV environment variables to use the mounted portable directories
@@ -537,6 +681,107 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
 
         return ExecuteContainerCommandArgs(
             command=r2e_gym_cmd,
+            expected_file_pattern=search_path,
+            mode="eval",
+            timeout=self.config.swebench_tests_timeout + 120,
+        )
+
+
+class SWESmithDatasetProcessor(BaseDatasetHarnessProcessor):
+    # [CUSTOM 2026-10-08] SWE-smith's own `swesmith.harness.eval`/`RepoProfile.get_container()`
+    # launch a NEW Docker container internally. We replicate the same logic here without the
+    # containerm since we already run inside Singularity.
+    def setup(self) -> Path:
+        eval_harness_repo = "https://github.com/SWE-bench/SWE-smith.git"
+        eval_harness_commit = "HEAD"
+
+        setup_dir = self.parent_dir / "swe_swesmith_setup"
+
+        with self._setup_directory_lock(setup_dir, "SWE-smith"):
+            swesmith_dir = setup_dir / "SWE-smith"
+            uv_dir = setup_dir / "uv"
+            python_dir = setup_dir / "python"
+
+            venv_dir = swesmith_dir / "venv"
+            python_bin = venv_dir / "bin" / "python"
+            driver_dst = swesmith_dir / "swesmith_eval_driver.py"
+            driver_src = self.parent_dir / "swesmith_eval_driver.py"
+            if swesmith_dir.exists() and venv_dir.exists() and python_bin.exists():
+                driver_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(driver_src, driver_dst)
+                result = subprocess_run([str(python_bin), "-c", "from swesmith.profiles import registry"])
+                if result.returncode == 0:
+                    print(f"SWE-smith already set up at {setup_dir}", flush=True)
+                    self._ensure_swesmith_image(swesmith_dir, setup_dir / "swesmith.img", force=False)
+                    return setup_dir
+
+                print("SWE-smith directory exists but module not properly installed, rebuilding...", flush=True)
+
+            print(f"Setting up SWE-smith environment at {setup_dir}...", flush=True)
+            setup_dir.mkdir(parents=True, exist_ok=True)
+
+            script_fpath = self.parent_dir / "setup_scripts/swesmith.sh"
+            command = f"""SETUP_DIR={setup_dir} \\
+UV_DIR={uv_dir} \\
+PYTHON_DIR={python_dir} \\
+SWESMITH_DIR={swesmith_dir} \\
+EVAL_HARNESS_REPO={eval_harness_repo} \\
+EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+    {script_fpath}"""
+            self._run_setup_command(command)
+
+            # Our own driver (not part of the vendored package) needs to live inside
+            # swesmith_dir so it's covered by the SAME bind-mount as the venv -- see
+            # _build_apptainer_command's SWE-smith branch, which mounts swesmith_setup_dir only
+            # once (uv's venv wrappers use hardcoded absolute paths, same reasoning as
+            # R2E-Gym/SWE-bench's own setup dirs).
+            shutil.copy(driver_src, driver_dst)
+
+            # force=True: swesmith_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_swesmith_image(swesmith_dir, setup_dir / "swesmith.img", force=True)
+            return setup_dir
+
+    def _ensure_swesmith_image(self, swesmith_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over swesmith_dir/venv -- see scripts/vm/build_swesmith_image.sh
+        and OpenHandsHarnessProcessor._ensure_openhands_image (same pattern, imaged here mainly
+        for consistency/concurrency headroom across all dataset venvs rather than a confirmed
+        stall -- see build_swesmith_image.sh's header)."""
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_swesmith_image.sh"
+        logger.info("Building SWE-smith block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {swesmith_dir} {image_path}")
+
+    def get_run_command(self) -> ExecuteContainerCommandArgs:
+        swesmith_cmd = (
+            f'date +"%s.%N" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpath} && '
+            f"{self._get_command_sleep_until_predictions_file()} && "
+            f'export UV_INSTALL_DIR="{self.config.swesmith_setup_dir}/uv" && '
+            f'export UV_PYTHON_INSTALL_DIR="{self.config.swesmith_setup_dir}/python" && '
+            f'export PATH="{self.config.swesmith_setup_dir}/uv/bin:$PATH" && '
+            # Run with clean environment to avoid venv contamination, use the pre-built venv
+            # directly with its absolute path -- same pattern as every other processor here.
+            f"env -u VIRTUAL_ENV {self.config.swesmith_setup_dir}/SWE-smith/venv/bin/python "
+            f"{self.config.swesmith_setup_dir}/SWE-smith/swesmith_eval_driver.py "
+            f"    --dataset_path /root/dataset/data.jsonl "
+            f"    --predictions_path {self.config.output_for_eval_mounted_path} "
+            f"    --instance_id {self.config.instance_id} "
+            f"    --testbed_dir /testbed "
+            f"    --timeout {self.config.swebench_tests_timeout} "
+            f"    --report_path /trajectories_mount/eval-outputs/{self.config.agent_run_id}/report.json"
+        )
+
+        search_path = os.path.join(
+            self.config.persistent_dir,
+            "eval-outputs",
+            self.config.agent_run_id,
+            "report.json",
+        )
+
+        return ExecuteContainerCommandArgs(
+            command=swesmith_cmd,
             expected_file_pattern=search_path,
             mode="eval",
             timeout=self.config.swebench_tests_timeout + 120,
@@ -764,6 +1009,16 @@ REBENCH_DIR={rebench_dir} \
         repo = instance_dict.get("repo", "")
         repo_name = repo.split("/")[1] if "/" in repo else repo
 
+        # [CUSTOM-SWEREBENCH-V1-EVAL-CD-FIX 2026-10-16] This eval command is shared by both V1
+        # (plain "SWE-rebench") and V2 ("SWE-rebench-V2"), but `cd /{repo_name}` below is only
+        # correct for V2 -- V2's per-instance images check the repo out at exactly that path.
+        # V1's content lives at /testbed instead (and is separately `cp -a`'d to
+        # /workspace/<repo>__<version> for both modes, see _build_apptainer_command's
+        # CUSTOM-VM-SIDECAR SWE-rebench branch).
+        eval_cd_target = (
+            f"/{repo_name}" if self.config.problem_info["dataset_name"] == "SWE-rebench-V2" else "/testbed"
+        )
+
         test_patch = instance_dict.get("test_patch", "")
         test_patch_path = self.config.persistent_dir / "test_patch.diff"
         test_patch_path.write_text(test_patch)
@@ -791,6 +1046,15 @@ REBENCH_DIR={rebench_dir} \
         install_block = "\n".join(install_cmds) if install_cmds else ""
         test_block = "\n".join(test_cmds)
 
+        # [CUSTOM-SWEREBENCH-V2 2026-10-09] Was `git reset --hard HEAD`, which only discards
+        # working-tree edits -- correct for the old per-instance-image design where HEAD is
+        # already pinned at base_commit by construction, but silently wrong for the new
+        # shared-mirror design, where /{repo_name} is a copy of a generic multi-commit clone
+        # whose HEAD can be anywhere. Resetting to base_commit explicitly is a strict
+        # generalization: a no-op where HEAD == base_commit already, and the actual fix
+        # otherwise. Safe for both designs since the agent-side OpenHands harness already does
+        # the equivalent deep-reset-to-base_commit in its own initialize_runtime().
+        base_commit = instance_dict.get("base_commit", "")
         cmd = f"""#!/bin/bash
 set -e
 
@@ -798,8 +1062,8 @@ date +\"%s.%N\" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpa
 
 {self._get_command_sleep_until_predictions_file()}
 
-cd /{repo_name}
-git reset --hard HEAD
+cd {eval_cd_target}
+git reset --hard {base_commit}
 
 # Apply model patch
 git apply --reject --recount --ignore-space-change --whitespace=nowarn /root/patch.diff || true
@@ -1076,9 +1340,44 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
             openhands_dir = setup_dir / "OpenHands"
             miniforge_dir = setup_dir / "miniforge3"
 
-            if openhands_dir.exists() and Path(openhands_dir / ".venv" / "bin" / "python").exists():
-                print(f"OpenHands already set up at {setup_dir}", flush=True)
-                return setup_dir
+            # [CUSTOM-OPENHANDS-VENV-CHECK 2026-10-14] Previously just checked that
+            # .venv/bin/python exists. Howevr an interrupted `poetry install` left `python`
+            # present but other dependencies not available, causing `ModuleNotFoundError` 
+            # when importing inside OpenHands.
+            # Mirrors the real-import-check pattern 
+            # R2EGymDatasetProcessor/SWESmithDatasetProcessor.setup() already use above.
+            # [CUSTOM-OPENHANDS-VENV-CHECK-PPTX 2026-10-15] Added `pptx` after another
+            # `ModuleNotFoundError`. Fixed by adding a second `poetry install` pass in
+            # setup_scripts/openhands.sh; this addition just makes this check catch the gap if
+            # it recurs.
+            python_bin = openhands_dir / ".venv" / "bin" / "python"
+            if openhands_dir.exists() and python_bin.exists():
+                result = subprocess_run(
+                    [
+                        str(python_bin),
+                        "-c",
+                        "from openhands.core.main import create_runtime\n"
+                        "import PIL\n"
+                        "import browsergym\n"
+                        "import pandas\n"
+                        "import reportlab\n"
+                        "import gevent\n"
+                        "import pptx\n",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    print(f"OpenHands already set up at {setup_dir}", flush=True)
+                    self._ensure_openhands_image(openhands_dir, setup_dir / "openhands.img", force=False)
+                    return setup_dir
+
+                print(
+                    f"OpenHands directory exists at {setup_dir} but failed a real import check "
+                    f"(venv is incomplete/stale, not just missing) -- rebuilding. Import error "
+                    f"was:\n{result.stderr}",
+                    flush=True,
+                )
 
             print(f"Setting up OpenHands environment at {setup_dir}...", flush=True)
             rmtree(setup_dir, ignore_errors=True)
@@ -1093,7 +1392,48 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
+            # [CUSTOM-OPENHANDS-POST-REBUILD-VERIFY 2026-10-16] A final re-check here as
+            # a hard backstop in case the complete poetry install failed.
+            result = subprocess_run(
+                [
+                    str(python_bin),
+                    "-c",
+                    "from openhands.core.main import create_runtime\n"
+                    "import PIL\n"
+                    "import browsergym\n"
+                    "import pandas\n"
+                    "import reportlab\n"
+                    "import gevent\n"
+                    "import pptx\n",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (
+                f"OpenHands rebuild at {setup_dir} still failed the real import check afterward "
+                f"-- refusing to proceed with a known-broken venv. Import error was:\n{result.stderr}"
+            )
+
+            # force=True: openhands_dir's content just changed (fresh rebuild), so the baked
+            # image must be rebuilt too.
+            self._ensure_openhands_image(openhands_dir, setup_dir / "openhands.img", force=True)
             return setup_dir
+
+    def _ensure_openhands_image(self, openhands_dir: Path, image_path: Path, force: bool) -> None:
+        """[CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-27] Build (or rebuild) the read-only ext4 image
+        VM sidecar rollouts mount over openhands_dir -- see scripts/vm/build_openhands_image.sh
+        and nemo_gym/vm_launcher.py's block_device_mounts. Called from both setup() return
+        points, under the same per-setup-dir lock that guards openhands_dir itself, so the image
+        can never observe a half-written openhands_dir and can never silently diverge from it:
+        whenever openhands_dir is freshly rebuilt (force=True) the image is unconditionally
+        rebuilt alongside it; on the fast/cached "already set up" path (force=False) the image
+        is left alone if it already exists, since nothing about openhands_dir changed.
+        """
+        if not force and image_path.exists():
+            return
+        build_script = Path(_VM_LIB_SH).parent / "build_openhands_image.sh"
+        logger.info("Building OpenHands block-device image at %s (force=%s)...", image_path, force)
+        self._run_setup_command(f"{build_script} {openhands_dir} {image_path}")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         data_point = self.config.problem_info
@@ -1107,7 +1447,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             config = tomlkit.parse(f.read())
 
         config["llm"]["model"] |= {
-            "model": self.config.body.model,
+            "model": self.config.body.model or get_global_config_dict()["policy_model_name"],
             "base_url": "",  # May need to populate this
             "temperature": self.config.inference_params["temperature"],
             "top_p": self.config.inference_params["top_p"],
@@ -1140,7 +1480,9 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
 
         if data_point["dataset_name"] == "nv-internal-1" or data_point["dataset_name"] == "swe-bench-ext":
             crypto_fix_cmd = (
-                "_crypto_fix_dir=$(mktemp -d /tmp/crypto_fix_XXXXXX) && "
+                # [CUSTOM-TMPDIR-SCRATCH 2026-10-19] ${TMPDIR:-/tmp}, not a literal /tmp -- same
+                # overlay-size reasoning as OpenHandsHarnessProcessor's/R2E-Gym's HOME fixes above.
+                "_crypto_fix_dir=$(mktemp -d \"${TMPDIR:-/tmp}/crypto_fix_XXXXXX\") && "
                 "/openhands_setup/OpenHands/.venv/bin/python -m pip install "
                 "    --target=$_crypto_fix_dir "
                 "    --index-url https://pypi.org/simple "
@@ -1171,6 +1513,18 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             # Add miniforge bin to PATH (for tmux, node, poetry, etc.)
             "mkdir -p /tmp/ && "
             "export PATH=/openhands_setup/miniforge3/bin:$PATH && "
+            # Our apptainer invocation uses --cleanenv, so $USER is unset inside the container.
+            # OpenHands' LocalRuntime (openhands/runtime/utils/command.py) falls back to the
+            # hardcoded username "root" whenever override_username/$USER/$RUNTIME_USERNAME are
+            # all unset. Since we e have no root privileges here (no --fakeroot available in 
+            # Leonardo), this breaks things. SU_TO_USER=false is OpenHands' flag to avoid using
+            # root-privilege commands such as `su`.
+            "export SU_TO_USER=false && "
+            # The task repo (/testbed, baked into each instance's image at Docker build time,
+            # typically root-owned) belongs to a different UID than us (no --fakeroot, we're our
+            # real host UID). Git >=2.35.2's "dubious ownership" safety check then refuses any
+            # operation on it. `--add safe.directory '*'` is git's flag to avoid this.
+            "git config --global --add safe.directory '*' && "
             # Setup tmux socket (OpenHands requirement)
             "uid=$(id -ru 2>/dev/null || id -u) && "
             "export TMUX_TMPDIR=/tmp && "
@@ -1189,6 +1543,11 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             f"export NEMO_GYM_METRICS_FPATH={self.config.base_mounted_dir}/nemo_gym_metrics.json && "
             f"export NEMO_GYM_CONFIG_DICT={self.config.ng_global_config_dict_str} && "
             f"export NEMO_GYM_MODEL_SERVER_NAME={self.config.model_server_name} &&"
+            # [CUSTOM-CONTEXT-OVERFLOW-PREFLIGHT 2026-10-11] see the field docstring on
+            # SWEBenchWrapperConfig.max_model_len above for the usage of 
+            # NEMO_GYM_MAX_MODEL_LEN and NEMO_GYM_PREFLIGHT_HEADROOM_TOKENS.
+            f"export NEMO_GYM_MAX_MODEL_LEN={self.config.max_model_len or ''} &&"
+            f"export NEMO_GYM_PREFLIGHT_HEADROOM_TOKENS={self.config.preflight_headroom_tokens} &&"
             "export VIRTUAL_ENV=/openhands_setup/OpenHands/.venv && "
             "export PATH=$PATH:/openhands_setup/OpenHands/.venv/bin && "
             # CRITICAL: Configure poetry to only use the OpenHands venv (ignore external venvs)
@@ -1268,6 +1627,45 @@ def _classify_agent_error(err: Optional[str]) -> Optional[str]:
     if "stuck in a loop" in s.lower():
         return "stuck_in_loop"
     return "other"
+
+
+# [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] R2E-Gym's own per-instance images ship these two
+# files baked in at image-BUILD time: they are R2E-Gym's own infra (how-to-install / 
+# how-to-run-tests helpers).
+#
+# The bug this works around: OpenHands' own patch extraction
+# (evaluation/benchmarks/swe_bench/run_infer.py) does `git add -A && git diff --cached
+# <base_commit>`, which shows them as "new files", on every single rollout. At eval time,
+# a FRESH container (same image) already has these same files present, so `git apply`'s
+# fails with "already exists in working directory", masking whatever changes the agent
+# also made.
+_R2EGYM_INFRA_FILENAMES = frozenset({"install.sh", "run_tests.sh"})
+
+
+def _strip_r2egym_infra_files_from_patch(patch: str) -> str:
+    """Drop any unified-diff file block touching R2E-Gym's own baked-in infra files.
+
+    See _R2EGYM_INFRA_FILENAMES' docstring above for why these must never end up in the
+    model's graded patch.
+    """
+    if not patch:
+        return patch
+    lines = patch.splitlines(keepends=True)
+    out: List[str] = []
+    skipping = False
+    for line in lines:
+        if line.startswith("diff --git "):
+            # Format: "diff --git a/<path> b/<path>\n" -- path may itself contain spaces, so
+            # only rely on the well-known "a/" / "b/" prefixes, not naive whitespace splitting.
+            parts = line.rstrip("\n").split(" b/", 1)
+            a_path = parts[0][len("diff --git a/") :] if len(parts) == 2 else ""
+            b_path = parts[1] if len(parts) == 2 else ""
+            skipping = os.path.basename(a_path) in _R2EGYM_INFRA_FILENAMES or (
+                os.path.basename(b_path) in _R2EGYM_INFRA_FILENAMES
+            )
+        if not skipping:
+            out.append(line)
+    return "".join(out)
 
 
 @ray.remote(
@@ -1376,7 +1774,51 @@ class RunOpenHandsAgent(BaseModel):
         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
         log_file = open(log_file_path, "w")
 
-        process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
+        dataset_name = self.config.problem_info.get("dataset_name")
+        if _uses_vm_sidecar(dataset_name):
+            # [CUSTOM-VM-SIDECAR 2026-10-27] Route through this node's persistent VM sidecar
+            # instead of running the apptainer command directly on the host -- see
+            # nemo_gym/vm_launcher.py's.
+            #
+            # ensure_vm() is a blocking call (subprocess/file-lock based, like
+            # sandbox_launcher.ensure_sandbox()) -- safe to call directly here despite this
+            # being an async method because each rollout is its own Ray task running
+            # asyncio.run() in its own process; there is no other concurrent coroutine sharing
+            # this event loop for a blocking call to stall.
+            #
+            # Do a passthrough of HTTP_PROXY/HTTPS_PROXY (SSH does not punch through
+            # arbitrary environment variables by default).
+            proxy_env = {
+                var: os.environ[var]
+                for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+                if os.environ.get(var)
+            }
+            # [CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Every dataset harness's own venv is imaged
+            # as a dedicated read-only block device: these can be though of as basically 
+            # "pre-compiled disks" that are attached to the VM and contain all the files needed
+            # for the harness to work.
+            # Each image shadows ONLY its venv/.venv dir, NOT the whole setup dir.
+            openhands_dir = f"{self.config.openhands_setup_dir}/OpenHands"
+            openhands_image = f"{self.config.openhands_setup_dir}/openhands.img"
+            swebench_dir = f"{self.config.swebench_setup_dir}/SWE-bench"
+            swebench_image = f"{self.config.swebench_setup_dir}/swebench.img"
+            r2e_gym_dir = f"{self.config.r2e_gym_setup_dir}/R2E-Gym"
+            r2e_gym_image = f"{self.config.r2e_gym_setup_dir}/r2e_gym.img"
+            swesmith_dir = f"{self.config.swesmith_setup_dir}/SWE-smith"
+            swesmith_image = f"{self.config.swesmith_setup_dir}/swesmith.img"
+            vm_info = ensure_vm(
+                golden_image_dir=self.config.vm_golden_image_dir,
+                lustre_share_roots=self.config.vm_lustre_share_roots,
+                block_device_mounts=[
+                    (openhands_image, f"{openhands_dir}/.venv"),
+                    (swebench_image, f"{swebench_dir}/venv"),
+                    (r2e_gym_image, f"{r2e_gym_dir}/venv"),
+                    (swesmith_image, f"{swesmith_dir}/venv"),
+                ],
+            )
+            process = await run_in_vm(vm_info, apptainer_cmd, env=proxy_env, stdout=log_file, stderr=log_file)
+        else:
+            process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
 
         return ActiveContainerCommand(process=process, log_file=log_file, log_file_path=log_file_path)
 
@@ -1389,12 +1831,19 @@ class RunOpenHandsAgent(BaseModel):
             # Wait for completion with timeout
             await asyncio.wait_for(active_command.process.communicate(), timeout=command.timeout)
         except asyncio.TimeoutError:
-            if active_command.process.returncode is None:
-                active_command.process.kill()
-                await active_command.process.wait()
-            raise ValueError("Command timed out")
-        finally:
+            await _kill_and_reap_process(
+                active_command.process, context=f"{command.mode} container command for {self.config.instance_id}"
+            )
             active_command.log_file.close()
+            log_tail = active_command.log_file_path.read_text(errors="replace")[-4000:]
+            raise ValueError(
+                f"Command timed out after {command.timeout}s (mode={command.mode}, "
+                f"instance={data_point.get('instance_id')}, expected_file_pattern="
+                f"{command.expected_file_pattern!r}). Log tail:\n{log_tail}"
+            )
+        finally:
+            if not active_command.log_file.closed:
+                active_command.log_file.close()
 
         if active_command.process.returncode != 0:
             raise RuntimeError(
@@ -1416,15 +1865,16 @@ class RunOpenHandsAgent(BaseModel):
             )
             return latest_file
         else:
+            log_tail = active_command.log_file_path.read_text(errors="replace")[-4000:]
             raise ValueError(
                 f"Expected exactly one file matching {command.expected_file_pattern} for {data_point['instance_id']}, "
-                f"found {len(pred_files)}."
+                f"found {len(pred_files)} (mode={command.mode}, process returncode="
+                f"{active_command.process.returncode}, process exited cleanly but never produced "
+                f"the expected output file). Log tail:\n{log_tail}"
             )
 
     async def _kill_active_command(self, active_command: ActiveContainerCommand) -> None:
-        if active_command.process.returncode is None:
-            active_command.process.kill()
-            await active_command.process.wait()
+        await _kill_and_reap_process(active_command.process, context=f"container command for {self.config.instance_id}")
         active_command.log_file.close()
 
     async def process_single_datapoint(self) -> Optional[Path]:
@@ -1491,6 +1941,10 @@ class RunOpenHandsAgent(BaseModel):
 
         patch = out_dict["test_result"]["git_patch"] or None
         patch = patch + "\n" if patch and not patch.endswith("\n") else patch
+        # [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] see _strip_r2egym_infra_files_from_patch's
+        # docstring: fixing the "already exists" git-apply failure at eval time.
+        if patch and "R2E-Gym" in (self.config.problem_info.get("dataset_name", "") or ""):
+            patch = _strip_r2egym_infra_files_from_patch(patch)
         metrics.model_patch = patch
 
         # Create file in the SWE-bench evaluation format
@@ -1649,6 +2103,74 @@ class RunOpenHandsAgent(BaseModel):
 ########################################
 
 
+def _find_sif_normalized(container_dir: str, image_stem: str) -> list[str]:
+    """Hyphen/underscore/case-insensitive fallback for a shared-image `.sif` lookup.
+
+    Do a fuzzy search to match a dataset's own naming field (e.g. SWE-rebench-V2's
+    "kotlin-jdk-11") against the `.sif` file name (e.g. "kotlin_jdk_11.sif"). Colons are
+    stripped too (e.g. "php_8.3.16" vs "php:8.3.16").
+    """
+    if not os.path.isdir(container_dir):
+        return []
+    target = re.sub(r"[-_:]", "", image_stem).lower()
+    if not target:
+        return []
+    return [
+        os.path.join(container_dir, name)
+        for name in sorted(os.listdir(container_dir))
+        if name.endswith(".sif") and target in re.sub(r"[-_:]", "", name).lower()
+    ]
+
+
+# [CUSTOM-COPYOUT-DSTATE-REAP 2026-10-26] `process.kill()` sends SIGKILL, but a process blocked
+# in kernel D-state (uninterruptible I/O wait) cannot be killed by ANY signal until the
+# I/O it's blocked on completes or the filesystem driver gives up. `await process.wait()`
+# immediately after `kill()` therefore hangs for exactly as long as `communicate()` itself would
+# have -- the timeout just moves one line down instead of being eliminated.
+# Fix: bound the post-kill reap with its own short grace period. If the process hasn't exited
+# within it, it's genuinely D-state-stuck -- stop awaiting it (the orphan is leaked at the OS
+# level, but that's strictly better than the coroutine, its semaphore slot, and its trainer slot
+# being leaked right along with it) and let the caller treat this attempt as failed/retryable.
+async def _kill_and_reap_process(process: asyncio.subprocess.Process, context: str, grace_seconds: float = 15.0) -> bool:
+    """Kill `process` and wait up to `grace_seconds` for it to actually exit.
+
+    Returns True if the process was reaped, False if it's still alive after the grace period
+    (almost certainly D-state) and has been abandoned -- callers must not wait on it further.
+    """
+    if process.returncode is not None:
+        return True
+    process.kill()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+        return True
+    except asyncio.TimeoutError:
+        print(
+            f"WARNING: {context} did not exit within {grace_seconds:.0f}s of being killed -- "
+            f"likely stuck in kernel D-state on a degraded node. Abandoning it (leaked at the OS "
+            f"level) rather than blocking this rollout on it indefinitely.",
+            flush=True,
+        )
+        return False
+
+
+# [CUSTOM-VM-SIDECAR 2026-10-27] Which dataset types need the per-node VM sidecar (real root,
+# no --fakeroot) instead of running the apptainer command directly on the host -- see
+# nemo_gym/vm_launcher.py. Exactly the five dataset types that used to call
+# _copy_out_writable_paths for a writable /testbed or /{repo_name}; everything else (Harbor,
+# plain SWE-bench, SWE-bench_Multilingual, nv-internal-1, swe-bench-ext) never hit the
+# root-owned-path problem in the first place and keeps running on the bare host. Module-level
+# (not a method) because it's needed from both SWEBenchWrapper (_build_apptainer_command) and
+# RunOpenHandsAgent (_start_container_command), two different classes in this file.
+def _uses_vm_sidecar(dataset_name: Optional[str]) -> bool:
+    dataset_name = dataset_name or ""
+    return (
+        "SWE-Gym" in dataset_name
+        or "R2E-Gym" in dataset_name
+        or "SWE-smith" in dataset_name
+        or "SWE-rebench" in dataset_name  # covers both V1 and V2
+    )
+
+
 class SWEBenchWrapper(SimpleResponsesAPIAgent):
     config: SWEBenchWrapperConfig
 
@@ -1675,6 +2197,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             swebench_multilingual_setup_dir=SweBenchMultilingualDatasetProcessor(config=self.config).setup(),
             r2e_gym_setup_dir=R2EGymDatasetProcessor(config=self.config).setup(),
             swe_rebench_setup_dir=SWERebenchDatasetProcessor(config=self.config).setup(),
+            swesmith_setup_dir=SWESmithDatasetProcessor(config=self.config).setup(),
         )
 
         self._sem = Semaphore(self.config.concurrency)
@@ -1742,22 +2265,105 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         """
         instance_id = data_point["instance_id"]
         container_formatters = data_point["container_formatter"]
+        dataset_name = data_point["dataset_name"]
 
-        if isinstance(container_formatters, str):
+        if isinstance(container_formatters, dict):
+            # [CUSTOM-CONTAINER-FORMATTER-DICT 2026-10-21] Assign each row to its category 
+            # via it dataset_name. Raise if the category is missing from the 
+            # container_formatters dict.
+            if "SWE-smith" in dataset_name:
+                category = "SWE-smith"
+            elif dataset_name == "SWE-rebench-V2":
+                category = "SWE-rebench-V2"
+            elif "SWE-rebench" in dataset_name:
+                category = "SWE-rebench"
+            elif "R2E-Gym" in dataset_name:
+                category = "R2E-Gym"
+            else:
+                category = "default"
+            if category not in container_formatters:
+                raise ValueError(
+                    f"No container_formatter entry for dataset_name {dataset_name!r} (resolved "
+                    f"category {category!r}, instance_id {instance_id}). container_formatter "
+                    f"dict only has keys: {sorted(container_formatters)}. Add an entry for "
+                    f"{category!r} to this swe_agents instance's container_formatter config."
+                )
+            container_formatters = [container_formatters[category]]
+        elif isinstance(container_formatters, str):
             container_formatters = [container_formatters]
 
+        # [CUSTOM 2026-10-08] SWE-smith ships ONE SHARED IMAGE PER REPO, not per task instance.
+        # The row's `image_name` field uniquely identifies the shared image.
+        if "SWE-smith" in data_point["dataset_name"]:
+            instance_dict = json.loads(data_point["instance_dict"])
+            image_stem = instance_dict["image_name"].split("/")[-1]
+            for container_formatter in container_formatters:
+                container_path = container_formatter.format(instance_id=image_stem)
+                if os.path.exists(container_path):
+                    return container_path
+
+                container_dir = os.path.dirname(container_formatter.format(instance_id="dummy"))
+                matches = glob.glob(os.path.join(container_dir, f"*{image_stem}*.sif"))
+                if not matches:
+                    # Hyphen/underscore-insensitive fallback (see the SWE-rebench-V2 branch
+                    # below for why this is needed, e.g. "kotlin-jdk-11" vs "kotlin_jdk_11").
+                    matches = _find_sif_normalized(container_dir, image_stem)
+                if matches:
+                    return matches[0]
+            raise FileNotFoundError(
+                f"No SIF found for SWE-smith repo image {image_stem!r} (instance_id {instance_id}). "
+                f"Searched directories: {[os.path.dirname(cf.format(instance_id='dummy')) for cf in container_formatters]}"
+            )
+
+        # [CUSTOM-SWEREBENCH-V2 2026-10-14] Per-instance image lookup. The filename
+        # convention is `swerebenchv2-<org>-<repo>-<issue>-<commit_short>.sif`, e.g.
+        # `swerebenchv2-open-telemetry-opamp-go-201-146b792.sif`. We glob on repo+issue,
+        # then verify the match's commit prefix against our own `base_commit` to avoid a
+        # wrong-commit false positive if a repo is ever re-tagged.
+        if data_point["dataset_name"] == "SWE-rebench-V2":
+            instance_dict = json.loads(data_point["instance_dict"])
+            repo = instance_dict.get("repo", "")
+            base_commit = instance_dict.get("base_commit", "")
+            org_repo_key = repo.replace("/", "-").lower()
+            issue_match = re.search(r"-(\d+)$", instance_id)
+            issue = issue_match.group(1) if issue_match else None
+            for container_formatter in container_formatters:
+                container_dir = os.path.dirname(container_formatter.format(instance_id="dummy"))
+                pattern = os.path.join(container_dir, f"swerebenchv2-{org_repo_key}-{issue}-*.sif")
+                for candidate in glob.glob(pattern):
+                    commit_suffix = os.path.basename(candidate)[: -len(".sif")].rsplit("-", 1)[-1]
+                    if base_commit.startswith(commit_suffix):
+                        return candidate
+            raise FileNotFoundError(
+                f"No per-instance SIF found for SWE-rebench-V2 {repo!r} issue {issue!r} "
+                f"(instance_id {instance_id}, base_commit {base_commit[:10]}). "
+                f"Searched directories: {[os.path.dirname(cf.format(instance_id='dummy')) for cf in container_formatters]}"
+            )
+
         if "SWE-rebench" in data_point["dataset_name"]:
+            # [CUSTOM-SWEREBENCH-V1 2026-10-14] Some images use the same "_1776_"
+            # SWE-bench-mirror naming convention as SWE-smith's images, e.g.
+            # `swerebench-sweb.eval.x86_64.conan-io_1776_conan-12086.sif`.
+            # Reuse the same "__" -> "_1776_" substitution the generic candidate_ids
+            # fallback below already does for other datasets.
+            instance_id_1776 = instance_id.replace("__", "_1776_")
+            # [CUSTOM-SWEREBENCH-V1-CASE-INSENSITIVE 2026-10-16] some images are lowercased
+            # on disk. Adding the lowercased instance_id/instance_id_1776 as additional
+            # candidates.
             for container_formatter in container_formatters:
                 # Exact match: {instance_id}.sif (e.g. badges__shields-4557.sif)
                 container_path = container_formatter.format(instance_id=instance_id)
                 if os.path.exists(container_path):
                     return container_path
 
-                # Fuzzy match: glob for files containing the instance_id
+                # Fuzzy match: glob for files containing the instance_id, raw, "_1776_"-ified,
+                # or lowercased (disk filenames are always lowercase).
                 container_dir = os.path.dirname(container_formatter.format(instance_id="dummy"))
                 for pattern in [
                     f"{instance_id}*.sif",
                     f"*{instance_id}*.sif",
+                    f"*{instance_id_1776}*.sif",
+                    f"*{instance_id_1776.lower()}*.sif",
                 ]:
                     matches = glob.glob(os.path.join(container_dir, pattern))
                     if matches:
@@ -1777,6 +2383,26 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                     # print(f"container found: {container_name}", flush=True)
                     # print(f"container formatter: {container_formatter}", flush=True)
                     return container_name
+
+            # [CUSTOM-R2EGYM-SIFPULLKIT-NAMING 2026-10-14] Some other images are pulled
+            # and named via their own sif_slug() (e.g. "namanjain12-pillow_final-5dfe5f0f....sif"), 
+            # NOT the "<repo>_final_<hash>.sif" convention the transform above expects.
+            # Here we use another logic: strip a dotted/colon-bearing registry host, replace
+            # every non [a-zA-Z0-9._-] run with a single "-", then try and match.
+            instance_dict = json.loads(data_point["instance_dict"])
+            docker_image = instance_dict.get("docker_image", "")
+            if docker_image:
+                ref = docker_image
+                parts = ref.split("/")
+                if len(parts) >= 2 and ("." in parts[0] or ":" in parts[0]):
+                    ref = "/".join(parts[1:])
+                slug = re.sub(r"[^a-zA-Z0-9._-]", "-", ref)
+                slug = re.sub(r"-+", "-", slug).strip("-") + ".sif"
+                for container_formatter in container_formatters:
+                    container_dir = os.path.dirname(container_formatter.format(instance_id="dummy"))
+                    container_name = os.path.join(container_dir, slug)
+                    if os.path.exists(container_name):
+                        return container_name
 
         replacements = ["_1776_", "_s_"]
 
@@ -1824,15 +2450,44 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f"Searched in paths: {tried_paths}."
         )
 
+    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym, R2E-Gym, SWE-smith, SWE-rebench-V1, and
+    # SWE-rebench-V2 now run their apptainer command inside the per-node VM sidecar as
+    # real root (see nemo_gym/vm_launcher.py and _uses_vm_sidecar below), so those paths
+    # are directly writable. 
+    # One small quirk: R2E-Gym's held-out tests (/r2e_tests) must stay invisible to the
+    # AGENT, so do an explicit empty-dir bind mount in agent mode.
+    def _vm_task_integrity_mount_args(
+        self, problem_info: Dict[str, Any], persistent_dir: Path, mode: str
+    ) -> List[str]:
+        dataset_name = problem_info.get("dataset_name", "") or ""
+        if "R2E-Gym" in dataset_name and mode == "agent":
+            hide_paths = ["/r2e_tests"]
+        else:
+            return []
+
+        hide_root = persistent_dir / "vm_hidden_paths" / mode
+        mount_args: List[str] = []
+        for image_path in hide_paths:
+            dest = hide_root / image_path.lstrip("/")
+            dest.mkdir(parents=True, exist_ok=True)
+            mount_args.append(f"--mount type=bind,src={dest},dst={image_path}")
+        return mount_args
+
     def _build_apptainer_command(
         self, params: SWEBenchWrapperInstanceConfig, command: ExecuteContainerCommandArgs
     ) -> str:
         dataset_path_to_mount = str(params.instance_dataset_path)
         data_point = params.problem_info
 
-        # Fix localhost URLs not working sometimes
+        # Fix localhost URLs not working sometimes.
+        # [CUSTOM] Best-effort: without --fakeroot, /etc/hosts is the real host file
+        # bind-mounted in, and we can't write it as a non-root UID. All container_commands
+        # below are "&&"-joined into one script, so letting this fail would abort the entire
+        # agent run on line 1 ("agent_script.sh: line 1: /etc/hosts: Permission denied").
+        # Adding `|| true` keeps this best-effort without masking real failures in the rest
+        # of the chain.
         container_commands = []
-        container_commands.append("echo '127.0.0.1 localhost' >/etc/hosts")
+        container_commands.append("echo '127.0.0.1 localhost' >/etc/hosts || true")
 
         # Build mount arguments
         mount_args = [
@@ -1851,10 +2506,10 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 f"--mount type=bind,src={openhands_dir}/logs,dst={openhands_dir}/logs",
                 f"--mount type=bind,src={openhands_dir}/evaluation/oh,dst=/openhands_setup/OpenHands/evaluation/oh",
                 f"--mount type=bind,src={openhands_dir}/evaluation/oh,dst={openhands_dir}/evaluation/oh",
-                # Data
-                f"--mount type=bind,src={dataset_path_to_mount},dst=/root/dataset/data.jsonl",
             ]
         )
+        # /root/dataset/data.jsonl is mounted near the end of this function (search for
+        # dataset_path_to_mount below), not here with the other base mounts.
 
         if params.resolved_user_prompt_template:
             mount_args.append(
@@ -1905,6 +2560,14 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # print(f"Mounting R2E-Gym setup directory from: {self.r2e_gym_setup_dir}", flush=True)
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst=/r2egym_setup")
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst={params.r2e_gym_setup_dir}")
+            container_commands.append("mkdir -p /root/r2e_tests && cp -a /r2e_tests/. /root/r2e_tests/ || true")
+
+        if command.mode == "eval" and "SWE-smith" in data_point["dataset_name"]:
+            # Mount the entire setup directory (venv + our own driver script, see
+            # SWESmithDatasetProcessor.setup()) at both /swesmith_setup and its original
+            # absolute path -- same uv-hardcoded-absolute-paths reasoning as R2E-Gym/SWE-bench.
+            mount_args.append(f"--mount type=bind,src={params.swesmith_setup_dir},dst=/swesmith_setup")
+            mount_args.append(f"--mount type=bind,src={params.swesmith_setup_dir},dst={params.swesmith_setup_dir}")
 
         if command.mode == "eval" and "SWE-rebench" in data_point["dataset_name"]:
             rebench_setup_dir = params.swe_rebench_setup_dir
@@ -1936,16 +2599,33 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             mount_args.append(f"--mount type=bind,src={test_patch_path},dst=/root/test_patch.diff")
             mount_args.append(f"--mount type=bind,src={params.model_patch_path},dst=/root/patch.diff")
 
+        # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-rebench V1 (not V2) expects its repo checked out at
+        # /workspace/<repo>__<version>, not /testbed.
+        if "SWE-rebench" in data_point["dataset_name"] and data_point["dataset_name"] != "SWE-rebench-V2":
+            instance_dict = json.loads(data_point["instance_dict"])
+            workspace_dir_name = f"{instance_dict.get('repo', '')}__{instance_dict.get('version', '')}".replace(
+                "/", "__"
+            )
+            container_commands.append(
+                f"mkdir -p /workspace && cp -a /testbed /workspace/{workspace_dir_name} || true"
+            )
+
         if command.mode == "agent" and "R2E-Gym" in data_point["dataset_name"]:
             # Remove R2E-Gym test-related files.
             for root_dir in ["", "/root", "/testbed"]:
                 container_commands.append(
-                    # /r2e_tests contains evaluation tests that the agent should not see.
-                    f"rm -rf {root_dir}/r2e_tests && "
+                    # /r2e_tests holds evaluation tests the agent should not see. `|| true`:
+                    # this rm fails either way -- "Device or resource busy" at the path
+                    # _vm_task_integrity_mount_args' empty-dir bind mount is active (/r2e_tests
+                    # itself), "No such file or directory" at the others -- but in all cases the
+                    # agent never sees real r2e_tests content anyway, so let the step fail
+                    # without aborting the rest of the && chain instead of blocking the real
+                    # agent command from ever running.
+                    f"rm -rf {root_dir}/r2e_tests || true && "
                     # run_tests.sh launches the tests in /r2e_tests, so the agent should not see this either.
                     # We check that it contains the substring "r2e_tests"
                     # to avoid accidentally deleting an unrelated file with that name.
-                    f"if grep -qs r2e_tests {root_dir}/run_tests.sh; then rm -rf {root_dir}/run_tests.sh; fi"
+                    f"if grep -qs r2e_tests {root_dir}/run_tests.sh; then rm -rf {root_dir}/run_tests.sh || true; fi"
                 )
         container_commands.append(command.command)
         combined_command = " && ".join(container_commands)
@@ -1957,19 +2637,88 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         container_script_path = f"/container_scripts/{command.mode}_script.sh"
         mount_args.append(f"--mount type=bind,src={script_path},dst={container_script_path},ro")
 
+        # [CUSTOM-VM-SIDECAR 2026-10-27] see _vm_task_integrity_mount_args -- only R2E-Gym
+        # agent-mode's /r2e_tests hide mount lands here. Mode-specific fields kept (agent
+        # and eval get independently-computed mounts) even though only one dataset/mode
+        # combination populates them today, to avoid agent/eval cross-contamination.
+        mount_args.extend(
+            params.eval_copy_out_mount_args if command.mode == "eval" else params.copy_out_mount_args
+        )
+
+        mount_args.append(f"--mount type=bind,src={dataset_path_to_mount},dst=/root/dataset/data.jsonl")
+
         mount_str = " ".join(mount_args)
 
         env_args = ""
         if "SWE-rebench" in data_point["dataset_name"]:
             env_args = "--env _JAVA_OPTIONS=-Djava.net.preferIPv6Addresses=false "
 
+        # [CUSTOM-SWEREBENCH-V2-PROXY 2026-10-14, GENERALIZED 2026-10-15] SWE-rebench-V2's eval
+        # runs install_config.install (`npm ci`, `pip install`, etc.) inside the container to set
+        # up the test environment, which needs real internet access -- forward the proxy env vars.
+        for proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+            proxy_val = os.environ.get(proxy_var)
+            if proxy_val:
+                env_args += f"--env {proxy_var}={shlex.quote(proxy_val)} "
+
         # Launch Apptainer container and execute the script file
-        apptainer_cmd = (
-            f"apptainer exec --writable-tmpfs --cleanenv --pid --no-mount home,tmp,bind-paths "
-            f"{env_args}"
-            f"{mount_str} "
-            f" {params.container} bash {container_script_path}"
-        )
+        #
+        # [CUSTOM-CONTAIN-ISOLATION 2026-10-17/19] `--contain` restricts the container's
+        # filesystem view to only explicit binds -- without it, Apptainer transparently passes
+        # through any host path that exists identically inside and outside the container, so an
+        # explicit `,ro` bind to that same path doesn't actually enforce read-only (writes
+        # silently succeed and can corrupt shared state, e.g. a rollout's own `pip install`
+        # wiping packages from the shared OpenHands venv for every later rollout in the job).
+        # `--contain` also means `$HOME` and `/tmp` no longer pass through to the real host
+        # filesystem, so both fall onto `--writable-tmpfs`'s tiny 64MB overlay instead --
+        # toolchains that write there by default (Go's GOPATH, npm's cache, pip/R scratch files)
+        # then hit "no space left on device" mid build/install. Fix: give every container a real
+        # per-rollout home directory via `-H`, and a separate real scratch directory bound to
+        # `$TMPDIR` for tools that write to `/tmp` instead of `$HOME`.
+        #
+        # VM-sidecar containers get a guest-local scratch/home dir under /var/tmp instead of the
+        # host-created, 9p-shared persistent_dir used below for the host-direct path: writes made
+        # as root inside the guest do not propagate real ownership back through the 9p share, so
+        # tools that check tmpdir ownership (e.g. pytest) fail against a 9p-backed path. /var/tmp
+        # is used rather than /tmp because the latter is RAM-backed (tmpfs) and shared by every
+        # concurrent rollout on the node. Nothing reclaims this directory automatically, so it is
+        # removed explicitly in the background after each rollout (see below).
+        uses_vm_sidecar = _uses_vm_sidecar(data_point["dataset_name"])
+        if uses_vm_sidecar:
+            guest_scratch_dir = f"/var/tmp/swe_agents_scratch/{params.persistent_dir.name}_{command.mode}"
+            guest_home_dir = f"{guest_scratch_dir}_home"
+            # Capture apptainer's real exit code into `_rc` before backgrounding the cleanup
+            # `rm -rf`: backgrounding as the script's last statement would otherwise reset `$?`
+            # to the backgrounding operator's own (always-0) status.
+            #
+            # `--contain` only gives `-H {guest_home_dir}` an implicit bind; `--env TMPDIR=...`
+            # does not get one, so guest_scratch_dir also needs its own explicit same-path bind
+            # mount to be visible inside the container.
+            apptainer_cmd = (
+                f"mkdir -p {guest_scratch_dir} {guest_home_dir} && "
+                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
+                f"--no-mount tmp,bind-paths -H {guest_home_dir} --env TMPDIR={guest_scratch_dir} "
+                f"--mount type=bind,src={guest_scratch_dir},dst={guest_scratch_dir} "
+                f"{env_args}"
+                f"{mount_str} "
+                f" {params.container} bash {container_script_path}"
+                f"; _rc=$?"
+                f"; nohup timeout 30 rm -rf {guest_scratch_dir} {guest_home_dir} >/dev/null 2>&1 "
+                f"& exit $_rc"
+            )
+        else:
+            tmp_scratch_dir = params.persistent_dir / "tmp_scratch"
+            tmp_scratch_dir.mkdir(parents=True, exist_ok=True)
+            home_scratch_dir = params.persistent_dir / "home_scratch"
+            home_scratch_dir.mkdir(parents=True, exist_ok=True)
+            apptainer_cmd = (
+                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
+                f"--no-mount tmp,bind-paths -H {home_scratch_dir} "
+                f"--mount type=bind,src={tmp_scratch_dir},dst=/tmp_scratch --env TMPDIR=/tmp_scratch "
+                f"{env_args}"
+                f"{mount_str} "
+                f" {params.container} bash {container_script_path}"
+            )
         memory_limit_mb = params.apptainer_memory_limit_mb
         if memory_limit_mb is not None and memory_limit_mb > 0:
             memory_limit_kb = int(memory_limit_mb) * 1024
@@ -1985,7 +2734,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             return str(p)
         return str(PARENT_DIR / p)
 
-    def _setup_params(
+    async def _setup_params(
         self, body: NeMoGymResponseCreateParamsNonStreaming
     ) -> Tuple[SWEBenchWrapperInstanceConfig, BaseDatasetHarnessProcessor]:
         problem_info = body.metadata | {"container_formatter": self.config.container_formatter}
@@ -2027,6 +2776,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 inference_params[key] = value
 
         container = self._find_container(problem_info)
+        # [CUSTOM-R2EGYM-EVAL-ISOLATION 2026-10-09] Two independent copies, not one shared
+        # between agent and eval -- see SWEBenchWrapperInstanceConfig.copy_out_mount_args'
+        # docstring for the bug this fixes (agent's own untracked scaffold files leaking into
+        # eval's supposedly-clean checkout and breaking `git apply` on the model's patch).
+        copy_out_mount_args = self._vm_task_integrity_mount_args(problem_info, persistent_dir, "agent")
+        eval_copy_out_mount_args = self._vm_task_integrity_mount_args(problem_info, persistent_dir, "eval")
 
         eval_dir_in_openhands = f"evaluation/oh/{agent_run_id}"
         openhands_config_file_path = f"/tmp/config_{agent_run_id}.toml"
@@ -2057,6 +2812,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             prediction_path=prediction_path,
             model_patch_path=persistent_dir / "patch.diff",
             container=container,
+            copy_out_mount_args=copy_out_mount_args,
+            eval_copy_out_mount_args=eval_copy_out_mount_args,
             eval_dir_in_openhands=eval_dir_in_openhands,
             openhands_config_file_path=openhands_config_file_path,
             agent_script_path=agent_script_path,
@@ -2091,6 +2848,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             dataset_processor = SWERebenchDatasetProcessor(config=params)
         elif "R2E-Gym" in params.problem_info["dataset_name"]:
             dataset_processor = R2EGymDatasetProcessor(config=params)
+        elif "SWE-smith" in params.problem_info["dataset_name"]:
+            dataset_processor = SWESmithDatasetProcessor(config=params)
         elif "SWE-bench_Multilingual" in params.problem_info["dataset_name"]:
             dataset_processor = SweBenchMultilingualDatasetProcessor(config=params)
         else:
@@ -2106,7 +2865,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         return params, dataset_processor
 
     async def responses(self, body: NeMoGymResponseCreateParamsNonStreaming = Body()) -> NeMoGymResponse:
-        params, dataset_processor = self._setup_params(body)
+        params, dataset_processor = await self._setup_params(body)
 
         with (params.persistent_dir / "params.json").open("w") as f:
             f.write(params.model_dump_json(indent=4))
@@ -2175,7 +2934,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         return NeMoGymResponse(
             id=f"swebench-{params.instance_id}",
             created_at=int(time.time()),
-            model=params.body.model,
+            model=params.body.model or get_global_config_dict()["policy_model_name"],
             object="response",
             output=output_items,
             parallel_tool_calls=params.body.parallel_tool_calls,

@@ -12,24 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import re
+import time
 from typing import Any
 
 import httpx
-from harbor.llms.base import (
-    BaseLLM,
-    ContextLengthExceededError,
-    LLMResponse,
-    OutputLengthExceededError,
-)
+from harbor.llms.base import BaseLLM, ContextLengthExceededError, LLMResponse, OutputLengthExceededError
 from harbor.models.metric import UsageInfo
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    retry_if_not_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 
@@ -58,6 +49,7 @@ class NemoGymLLM(BaseLLM):
         model_info: dict[str, Any] | None = None,
         responses_create_params: dict[str, Any] | None = None,
         timeout_sec: float = 600.0,
+        logger: logging.Logger | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -66,6 +58,36 @@ class NemoGymLLM(BaseLLM):
         self._collect_rollout_details = collect_rollout_details
         self._model_info = model_info or {}
         self._timeout_sec = timeout_sec
+
+        # [UPSTREAM-FIX nemo-nemo/Gym#1669, a7c4c7bf3] Persistent HTTP client, reused
+        # across every turn of the episode. The Gym vllm_model server pins a session to
+        # one vLLM engine via a cookie-based SessionMiddleware
+        # (responses_api_models/vllm_model/app.py); a fresh client per call drops that
+        # cookie, so the server mints a NEW session_id each turn and round-robins it to a
+        # (usually different) engine. With many DP engines that means the growing
+        # conversation prefix is almost never warm in the engine handling the next turn
+        # -> prefix-cache miss -> the full context is re-prefilled every turn. Reusing one
+        # client keeps the session cookie, so the whole episode lands on the same engine
+        # and prefix caching only prefills the new tokens each turn. Lazily created on
+        # first use. See related:
+        # - commit https://github.com/NVIDIA-NeMo/Gym/commit/a7c4c7bf3735f240870b5b09bc241f4490c0e62e
+        # - PR https://github.com/NVIDIA-NeMo/Gym/pull/1669
+        self._http_client: httpx.AsyncClient | None = None
+        # [CUSTOM 2026-10-07] BaseLLM never sets self._logger -- the two pre-existing
+        # call sites below (get_model_context_limit/get_model_output_limit) were latent
+        # AttributeErrors on their fallback path. `logger`, when passed, is the real
+        # per-trial logger Terminus2NemoGym pulled out of its own **kwargs (see there) --
+        # a child of it lands in the same job.log FileHandler at the same DEBUG-enabled
+        # level as everything else in the trial. Falls back to a standalone module logger
+        # (not captured anywhere useful without a handler) for construction outside a real
+        # trial, e.g. unit tests.
+        self._logger = logger.getChild(__name__) if logger is not None else logging.getLogger(__name__)
+        # Investigating AgentTimeoutError (900s wall-clock kill) hitting ~15-20% of
+        # Harbor rollouts with no clear signal of how much real progress was made.
+        # Counts every real HTTP attempt this instance makes, across both this class's
+        # own @retry on call() and Terminus2's outer @retry on _query_llm -- see the
+        # logging in _post_chat_completions below.
+        self._call_attempt_counter = 0
 
         # Accumulated token IDs from the most recent turn, used for
         # on-policy correction via _replace_prefix_tokens in vLLM.
@@ -247,8 +269,42 @@ class NemoGymLLM(BaseLLM):
     ) -> dict[str, Any]:
         endpoint = self._chat_completions_endpoint()
         timeout = timeout_sec if timeout_sec is not None else self._timeout_sec
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(endpoint, json=payload)
+
+        # [CUSTOM] Diagnostic-only instrumentation for the AgentTimeoutError
+        # investigation -- no behavior change, no new timeout/cancellation. This is the
+        # single choke point every real HTTP attempt passes through, whether triggered by
+        # this class's own @retry on call() or Terminus2's outer @retry on _query_llm (up
+        # to 3x3=9 real attempts for one logical LLM turn) -- logging every attempt here
+        # lets us see the real attempt count/timing/exception type instead of inferring it
+        # from Harbor's own "Unknown Error in LLM interaction: " log line, whose {e}
+        # interpolation is empty for exceptions like httpx's timeout errors (they often
+        # stringify to "").
+        self._call_attempt_counter += 1
+        attempt = self._call_attempt_counter
+        start = time.monotonic()
+        self._logger.info(f"[nemo_gym_llm] attempt={attempt} POST {endpoint} (timeout={timeout}s) starting")
+
+        try:
+            # [UPSTREAM-FIX nemo-nemo/Gym#1669, a7c4c7bf3] Reuse the persistent client so
+            # the session cookie (and thus the engine the session is pinned to) carries
+            # across turns. Timeout is applied per-request, so the per-call override is
+            # preserved regardless of the client's default.
+            if self._http_client is None:
+                self._http_client = httpx.AsyncClient(timeout=timeout)
+            response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
+        except Exception as e:
+            elapsed = time.monotonic() - start
+            self._logger.info(
+                f"[nemo_gym_llm] attempt={attempt} POST {endpoint} FAILED after {elapsed:.1f}s: "
+                f"{type(e).__name__}: {e!r}"
+            )
+            raise
+
+        elapsed = time.monotonic() - start
+        self._logger.info(
+            f"[nemo_gym_llm] attempt={attempt} POST {endpoint} responded after {elapsed:.1f}s, "
+            f"status={response.status_code}"
+        )
 
         if response.status_code >= 400:
             error_text = response.text.lower()
@@ -258,6 +314,16 @@ class NemoGymLLM(BaseLLM):
             response.raise_for_status()
 
         return response.json()
+
+    async def aclose(self) -> None:
+        """Close the persistent HTTP client. Called at episode end; best-effort
+        (the per-trial process exits anyway, but this avoids leaked connections /
+        'client was not closed' warnings when many episodes run in one process)."""
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            finally:
+                self._http_client = None
 
     def _chat_completions_endpoint(self) -> str:
         if self._api_base.endswith("/v1"):

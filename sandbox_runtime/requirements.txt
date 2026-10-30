@@ -1,0 +1,33 @@
+# Dependencies for the standalone nemo_skills sandbox process that
+# nemo_gym/sandbox_launcher.py runs inside a Singularity container (see that module's
+# docstring). This is NOT a Gym resources server or agent -- local_sandbox_server.py is a
+# bare Flask app with no dependency on nemo_gym/Ray/openai/torch at all, so unlike every
+# other per-actor venv in this repo, this one is built by its own small step in launch.sh,
+# not through GYM_SPECS (which unconditionally force-installs ray[default]/openai/torch --
+# multi-GB, CUDA-linked, and entirely unused here).
+#
+# nemo-skills-tools pin kept identical to resources_servers/ns_tools/requirements.txt and
+# resources_servers/reasoning_gym/requirements.txt -- bump all three together.
+## NeMo-Skills tools subpackage as of April 8, 2026
+nemo-skills-tools @ git+https://github.com/NVIDIA-NeMo/Skills.git@0596dd20cf9ce338a9a4f1e0010fd67ceb1bb4e6#subdirectory=tools
+## nemo-skills-tools' own METADATA declares `Requires-Dist: mcp` with no version
+## constraint. Its pinned commit (April 2026) still imports the MCP SDK's old
+## `streamablehttp_client` name (mcp.client.streamable_http), which was dropped
+## in the mcp 2.0.0 major rewrite (July 2026) in favor of `streamable_http_client`.
+## Pin below the 2.x break so the unlocked `uv pip install -r requirements.txt`
+## resolution doesn't silently pick up an incompatible newer mcp release.
+mcp<2.0.0
+
+## local_sandbox_server.py's own direct third-party imports (confirmed via grep against
+## nemo_skills/code_execution/local_sandbox/local_sandbox_server.py): flask, IPython
+## (IPython.terminal.interactiveshell), traitlets (traitlets.config), psutil. The earlier
+## isolation validation this session (bind-mount + Singularity + live Flask server, all
+## confirmed working) used an ad-hoc unpinned `uv pip install flask ipython psutil
+## traitlets` in a throwaway venv (since deleted) -- it proved the *mechanism* works, not
+## these specific version numbers. Pins below are current-as-of-implementation baselines,
+## not re-derived from that test; must be validated by actually building this venv and
+## importing local_sandbox_server (task #28), not assumed from this comment.
+flask==3.1.2
+ipython==9.6.0
+traitlets==5.14.3
+psutil==7.1.0

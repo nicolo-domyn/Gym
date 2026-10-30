@@ -370,6 +370,16 @@ def setup_common_directories() -> None:
         except FileExistsError:
             # Path exists but is not a directory (e.g. some R2E-Gym / Singularity images)
             logger.debug("Skip creating %s (exists and is not a directory)", directory)
+        except PermissionError:
+            # [CUSTOM] Expected and benign without --fakeroot: most of these paths
+            # (/root/.cache, /etc/apt/..., /usr/local/bin) are root-owned in the base image.
+            # This whole function exists to work around fakeroot+overlay quirks in the first
+            # place ("These may exist in base image but need overlay promotion") -- without
+            # fakeroot there's no overlay-promotion problem to work around, these paths just
+            # aren't writable by our real UID, which is fine; nothing downstream depends on
+            # them existing. Confirmed by direct testing: without this, server startup
+            # crashed uncaught on the very first root-owned path (/root/.cache).
+            logger.debug("Skip creating %s (permission denied, likely running without --fakeroot)", directory)
 
     logger.debug("Created common directories")
 
@@ -379,15 +389,25 @@ def setup_fake_sudo() -> None:
 
     Singularity fakeroot already runs as "root", so sudo is unnecessary
     but some scripts expect it to exist.
+
+    [CUSTOM] No-ops (logs and returns) without --fakeroot: /usr/local/bin is root-owned in
+    most base images, so writing here fails with PermissionError when running as the real
+    (non-fakeroot-mapped) UID. There's no real "sudo" to fake in that case anyway -- if a
+    script needs actual root to do something, not having --fakeroot is the actual blocker,
+    a fake sudo shim wouldn't fix that regardless of whether this function could write it.
     """
     sudo_path = "/usr/local/bin/sudo"
-    os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
 
-    with open(sudo_path, "w") as f:
-        f.write("#!/bin/bash\n")
-        f.write("# Fake sudo for Singularity fakeroot\n")
-        f.write('exec "$@"\n')
-    os.chmod(sudo_path, 0o755)
+        with open(sudo_path, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write("# Fake sudo for Singularity fakeroot\n")
+            f.write('exec "$@"\n')
+        os.chmod(sudo_path, 0o755)
+    except PermissionError:
+        logger.debug("Skip creating fake sudo (permission denied, likely running without --fakeroot)")
+        return
 
     logger.debug("Created fake sudo")
 

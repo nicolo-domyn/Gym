@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import reasoning_gym
@@ -23,12 +24,23 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
 from resources_servers.reasoning_gym.app import (
     ReasoningGymResourcesServer,
     ReasoningGymResourcesServerConfig,
     ReasoningGymVerifyRequest,
 )
+
+
+class _FakeRequest:
+    """Minimal stand-in for fastapi.Request -- just what execute_tool()/verify() read."""
+
+    def __init__(self, session: dict, body: dict):
+        self.session = session
+        self._body = body
+
+    async def json(self):
+        return self._body
 
 
 class TestApp:
@@ -87,7 +99,7 @@ class TestApp:
             metadata=entry["metadata"],
         )
 
-        verify_response = await server.verify(verify_request)
+        verify_response = await server.verify(None, verify_request)
 
         assert verify_response.reward >= 0.9, f"Expected high reward for correct answer, got {verify_response.reward}"
 
@@ -108,7 +120,7 @@ class TestApp:
             metadata=entry["metadata"],
         )
 
-        verify_response = await server.verify(verify_request)
+        verify_response = await server.verify(None, verify_request)
 
         assert verify_response.reward <= 0.1, f"Expected low reward for incorrect answer, got {verify_response.reward}"
 
@@ -132,7 +144,71 @@ class TestApp:
                 metadata=entry["metadata"],
             )
 
-            verify_response = await server.verify(verify_request)
+            verify_response = await server.verify(None, verify_request)
 
             assert verify_response.reward >= 0.9, f"Task {task_name} failed: reward={verify_response.reward}"
             assert verify_response.task_name == task_name
+
+    def test_config_with_tools(self) -> None:
+        """Test that tool-related config fields are accepted and construct the server."""
+        config = ReasoningGymResourcesServerConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="reasoning_gym",
+            nemo_skills_tools=["nemo_skills.mcp.servers.python_tool::DirectPythonTool"],
+            nemo_skills_tool_overrides={"DirectPythonTool": {"exec_timeout_s": 10}},
+            sandbox_host="127.0.0.1",
+            sandbox_port="6000",
+        )
+        server = ReasoningGymResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+        assert server.config.nemo_skills_tools == ["nemo_skills.mcp.servers.python_tool::DirectPythonTool"]
+        assert server.config.sandbox_host == "127.0.0.1"
+        assert server.config.sandbox_port == "6000"
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_dispatches_and_tracks_timing(self, server) -> None:
+        """execute_tool() should dispatch to the ToolManager and record per-session timing."""
+        server.tool_manager = MagicMock()
+        server.tool_manager.execute_tool = AsyncMock(return_value=json.dumps({"process_status": "completed", "stdout": "4\n"}))
+        server._tool_name_map = {"stateful_python_code_exec": "stateful_python_code_exec"}
+
+        request = _FakeRequest(session={SESSION_ID_KEY: "test-session"}, body={"code": "print(2+2)"})
+        response = await server.execute_tool("stateful_python_code_exec", request)
+
+        assert json.loads(response.body)["process_status"] == "completed"
+        server.tool_manager.execute_tool.assert_called_once_with(
+            raw_name="stateful_python_code_exec",
+            args={"code": "print(2+2)"},
+            extra_args={"request_id": "test-session"},
+        )
+        assert "test-session" in server._timing_by_session
+        assert len(server._timing_by_session["test-session"]) == 1
+        assert server._timing_by_session["test-session"][0]["is_internal_timeout"] is False
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_unknown_tool(self, server) -> None:
+        """Requesting a tool name not in the loaded tool map should error, not crash."""
+        server.tool_manager = MagicMock()
+        server._tool_name_map = {}
+
+        request = _FakeRequest(session={SESSION_ID_KEY: "test-session"}, body={})
+        response = await server.execute_tool("not_a_real_tool", request)
+
+        assert "error" in json.loads(response.body)
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_records_internal_timeout(self, server) -> None:
+        """A sandbox-reported timeout (process_status == 'timeout') should be tracked, not raised."""
+        server.tool_manager = MagicMock()
+        server.tool_manager.execute_tool = AsyncMock(
+            return_value=json.dumps({"process_status": "timeout", "stdout": "", "stderr": "Client timed out\n"})
+        )
+        server._tool_name_map = {"stateful_python_code_exec": "stateful_python_code_exec"}
+
+        request = _FakeRequest(session={SESSION_ID_KEY: "timeout-session"}, body={"code": "while True: pass"})
+        response = await server.execute_tool("stateful_python_code_exec", request)
+
+        assert json.loads(response.body)["process_status"] == "timeout"
+        assert server._timing_by_session["timeout-session"][0]["is_internal_timeout"] is True

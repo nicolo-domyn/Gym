@@ -13,11 +13,31 @@ harbor_agent:
       # Each alias must define exactly one source:
       # - local_dataset_path
       # - or dataset_name (+ optional dataset_version)
-     # Optional per-alias workdir can override global harbor_environment_kwargs.workdir.
+      # Optional per-alias workdir can override global harbor_environment_kwargs.workdir.
       # Requests must provide instance_id as "<dataset_alias>::<task_name>".
+      #
+      # [CUSTOM] Paths point at scripts/pull_harbor_tasks.sh's extraction output.
+      # Alias names match the HF archive's own top-level folder name.
+      # Only these 6 categories are extracted so far; add aliases here once that data
+      # exists and the corresponding category images are built.
       harbor_datasets:
-        scientific:
-          local_dataset_path: "responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks/skill_based/mixed/scientific_computing"
+        file_operations:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/file_operations"
+          workdir: "/app"
+        data_science:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/data_science"
+          workdir: "/app"
+        data_processing:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/data_processing"
+          workdir: "/app"
+        scientific_computing:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/scientific_computing"
+          workdir: "/app"
+        security:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/security"
+          workdir: "/app"
+        debugging:
+          local_dataset_path: "${oc.env:HARBOR_TASKS_DIR}/debugging"
           workdir: "/app"
 
       # Agent – which Harbor agent to use (set name or import_path)
@@ -49,8 +69,11 @@ harbor_agent:
       # Use custom Singularity backend for HPC clusters.
       harbor_environment_import_path: "responses_api_agents.harbor_agent.custom_envs.singularity.singularity:SingularityEnvironment"
       harbor_environment_kwargs:
-        # Shared host cache for converted .sif images (avoid repeated pulls/conversions across jobs).
-        singularity_image_cache_dir: "responses_api_agents/harbor_agent/singularity_cache"
+        # [CUSTOM] Shared, pre-built category images -- NOT a per-user cache.
+        singularity_image_cache_dir: "${oc.env:HARBOR_SIF_DIR,/leonardo_scratch/fast/BOOST_EUROPA/images/harbor}"
+        # [CUSTOM] This cluster has no unprivileged user namespaces, so we cannot use
+        # --fakeroot
+        singularity_fakeroot: false
 
       # Model routing: points agent LLM calls at the NeMo Gym model server alias.
       model_server:
@@ -71,4 +94,7 @@ harbor_agent:
       harbor_timeout_multiplier: null          # Multiplier (null = 1.0)
 
       # Output root directory for Harbor job artifacts.
-      harbor_jobs_dir: "/path/to/Gym/responses_api_agents/harbor_agent/jobs"
+      # [CUSTOM] Outside the repo, matching the data/image paths above -- per-rollout trial
+      # artifacts (trajectory.json, verifier output, exception files) accumulate fast on a
+      # long training job, same reasoning as this repo's other large-output-dir conventions.
+      harbor_jobs_dir: "/leonardo_scratch/fast/BOOST_EUROPA/${oc.env:USER}/harbor_jobs"
