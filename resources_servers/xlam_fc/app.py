@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import Field
 
@@ -56,7 +56,20 @@ class XlamFcResourcesServer(SimpleResourcesServer):
             return {}
 
     @staticmethod
-    def _function_calls_match(predicted: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    def _same_value(a: Any, b: Any) -> bool:
+        """BFCL-style comparison for schema defaults: numbers by value, strings case-insensitively."""
+        if isinstance(a, bool) or isinstance(b, bool):
+            return a is b
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return a == b
+        if isinstance(a, str) and isinstance(b, str):
+            return a.strip().lower() == b.strip().lower()
+        return a == b
+
+    @staticmethod
+    def _function_calls_match(
+        predicted: Dict[str, Any], expected: Dict[str, Any], properties: Optional[Dict[str, Any]] = None
+    ) -> bool:
         if predicted.get("name") != expected.get("name"):
             return False
 
@@ -69,7 +82,31 @@ class XlamFcResourcesServer(SimpleResourcesServer):
             if predicted_args[key] != expected_value:
                 return False
 
+        # [CUSTOM] Arguments beyond the label, as BFCL grades them: an extra argument passes only if the tool
+        # schema gives it a default and the call repeats that default. Extra arguments used to be ignored, and
+        # labels leave unprompted defaults out, so invented optional arguments were free in training while
+        # BFCL fails them (C3-160 -> C7-430: 86 -> 125 BFCL failures on optional arguments given a value).
+        for key, value in predicted_args.items():
+            if key in expected_args:
+                continue
+            schema = (properties or {}).get(key)
+            if not isinstance(schema, dict) or "default" not in schema:
+                return False
+            if not XlamFcResourcesServer._same_value(value, schema["default"]):
+                return False
+
         return True
+
+    @staticmethod
+    def _tool_properties(body: BaseVerifyRequest) -> Dict[str, Dict[str, Any]]:
+        """Tool name -> its parameters' JSON-schema properties, from the request's tool list."""
+        params = body.responses_create_params
+        tools = (params.model_dump() if hasattr(params, "model_dump") else params or {}).get("tools") or []
+        properties = {}
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("name"):
+                properties[tool["name"]] = ((tool.get("parameters") or {}).get("properties")) or {}
+        return properties
 
     def _extract_function_calls_from_response(self, body: BaseVerifyRequest) -> List[Dict[str, Any]]:
         function_calls = []
@@ -85,7 +122,10 @@ class XlamFcResourcesServer(SimpleResourcesServer):
         return function_calls
 
     def _calculate_reward(
-        self, predicted_calls: List[Dict[str, Any]], expected_answers: List[Dict[str, Any]]
+        self,
+        predicted_calls: List[Dict[str, Any]],
+        expected_answers: List[Dict[str, Any]],
+        tool_properties: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> tuple[float, int]:
         if not expected_answers:
             return (1.0, 0) if not predicted_calls else (0.0, 0)
@@ -98,7 +138,8 @@ class XlamFcResourcesServer(SimpleResourcesServer):
                 if i in matched_predicted_indices:
                     continue
 
-                if self._function_calls_match(predicted_call, expected_call):
+                properties = (tool_properties or {}).get(expected_call.get("name"))
+                if self._function_calls_match(predicted_call, expected_call, properties):
                     num_correct += 1
                     matched_predicted_indices.add(i)
                     break
@@ -109,7 +150,9 @@ class XlamFcResourcesServer(SimpleResourcesServer):
     async def verify(self, body: XlamFcVerifyRequest) -> XlamFcVerifyResponse:
         predicted_calls = self._extract_function_calls_from_response(body)
 
-        reward, num_correct = self._calculate_reward(predicted_calls, body.expected_answers)
+        reward, num_correct = self._calculate_reward(
+            predicted_calls, body.expected_answers, self._tool_properties(body)
+        )
 
         return XlamFcVerifyResponse(
             **body.model_dump(),

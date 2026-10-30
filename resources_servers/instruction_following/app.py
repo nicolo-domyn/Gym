@@ -14,7 +14,9 @@
 # limitations under the License.
 import asyncio
 import multiprocessing
+import os
 import queue
+import sys
 import threading
 from typing import List, Literal, Optional
 
@@ -28,6 +30,11 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+
+
+# [CUSTOM] ifx:* instructions live next to this file and are looked up after the registry.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ifx_instructions import INSTRUCTION_DICT as IFX_INSTRUCTION_DICT  # noqa: E402
 
 
 # [CUSTOM]
@@ -76,7 +83,9 @@ def _check_instructions(instruction_list: List, kwargs_list: List, final_respons
     for instruction_id, kwargs in zip(instruction_list, kwargs_list):
         try:
             # Create instruction instance
-            instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+            instruction_cls = (
+                instructions_registry.INSTRUCTION_DICT.get(instruction_id) or IFX_INSTRUCTION_DICT[instruction_id]
+            )
             instruction = instruction_cls(instruction_id)
 
             # Handle None kwargs
