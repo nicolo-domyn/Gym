@@ -1,0 +1,5 @@
+-e nemo-gym[dev] @ ../../
+trafilatura==2.0.0
+mcp==1.12.3
+# Optional distributed rate limiter (rate_limiter.py) -- backs rate_limiter_enabled: true.
+redis==5.2.1

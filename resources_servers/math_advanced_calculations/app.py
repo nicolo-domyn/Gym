@@ -101,6 +101,16 @@ class MultiVerseMathHardResourcesServer(SimpleResourcesServer):
         try:
             result = func(**args)
             return MultiVerseMathHardResponse(solution=result)
+        except (TypeError, ValueError, ArithmeticError) as e:
+            # [CUSTOM-MATHCALC-ERRORHANDLING 2026-10-24] These are client-input errors, not
+            # server bugs, for example: 
+            # - TypeError when the model omits a required arg (e.g. calling /log with 
+            #   only "a", no "base")
+            # - ValueError/ArithmeticError (covers ZeroDivisionError, logs of negative 
+            #   numbers, etc.)
+            # Previously these all fell through the bare `except Exception` below and
+            # came back as 500s, which is indistinguishable from an actual server fault.
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 

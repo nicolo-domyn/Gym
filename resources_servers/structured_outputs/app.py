@@ -15,11 +15,12 @@
 import csv
 import io
 import json
+import re
 import tomllib
 from collections import defaultdict
 from enum import StrEnum
 from statistics import mean
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import xmltodict
 import yaml
@@ -32,6 +33,73 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+
+
+# [CUSTOM] ifstruct's JSON-as-YAML rule (domyn-evals suites/ifstruct/ifstruct/validator.py).
+def _contains_flow_mapping(node: yaml.nodes.Node) -> bool:
+    """True if any non-empty mapping in the tree is flow style ({...}).
+
+    Flow sequences of scalars ([a, b]) and the empty mapping ({}) are idiomatic YAML; ifstruct also
+    rejects {}, but it is the only way to write an empty object.
+    """
+    if isinstance(node, yaml.MappingNode):
+        if node.flow_style and node.value:
+            return True
+        return any(_contains_flow_mapping(k) or _contains_flow_mapping(v) for k, v in node.value)
+    if isinstance(node, yaml.SequenceNode):
+        return any(_contains_flow_mapping(item) for item in node.value)
+    return False
+
+
+def is_flow_style_yaml(content: str) -> bool:
+    """True if a YAML answer is really JSON: a flow-style root collection or any flow-style mapping."""
+    try:
+        root = yaml.compose(content, Loader=yaml.SafeLoader)
+    except (yaml.YAMLError, RecursionError):
+        return False
+    if root is None:
+        return False
+    return getattr(root, "flow_style", None) is True or _contains_flow_mapping(root)
+
+
+# [CUSTOM] Markdown code fences, following ifstruct (domyn-evals suites/ifstruct): a fence is optional unless
+# the row requires or forbids one, and a language tag must match the requested format. The whole answer
+# must be the one fenced block; text outside it is not stripped and fails to parse.
+FENCE_RE = re.compile(r"\A```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)\n?[ \t]*```\Z", re.S)
+FENCE_LANGUAGES = {
+    "json": {"json"},
+    "yaml": {"yaml", "yml"},
+    "xml": {"xml"},
+    "toml": {"toml"},
+    "csv": {"csv"},
+}
+# Wording the training prompts use to forbid fences (C3 mix: 6,380 of 53,111 text-mode rows).
+NO_FENCE_RE = re.compile(
+    r"must not be in markdown|without styling it in backticks|not in ```[a-z]*``` format|"
+    r"no markdown fenc|without markdown fenc",
+    re.I,
+)
+
+
+def split_code_fence(text: str) -> Optional[Tuple[str, str]]:
+    """(language tag, body) if the text is exactly one fenced block, else None."""
+    match = FENCE_RE.match(text)
+    return (match.group(1).lower(), match.group(2)) if match else None
+
+
+def prompt_forbids_code_fence(responses_create_params: Any) -> bool:
+    messages = (responses_create_params or {}).get("input") or []
+    if isinstance(messages, str):
+        return bool(NO_FENCE_RE.search(messages))
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            parts = [content]
+        else:
+            parts = [part.get("text") or "" for part in content or [] if isinstance(part, dict)]
+        if any(NO_FENCE_RE.search(part) for part in parts):
+            return True
+    return False
 
 
 class StructuredOutputsResourcesServerConfig(BaseResourcesServerConfig):
@@ -70,6 +138,9 @@ class StructuredOutputsVerifyRequest(BaseVerifyRequest):
     tool_name_style: Optional[str] = None
     distractor_style: Optional[str] = None
     tool_union_mode: Optional[str] = None
+    # [CUSTOM] Markdown code fence policy for text answers; None = "forbidden" if the prompt says so
+    # (see NO_FENCE_RE), else "optional".
+    code_block: Optional[Literal["required", "optional", "forbidden"]] = None
 
 
 class StructuredOutputsVerifyResponse(BaseVerifyResponse):
@@ -98,6 +169,9 @@ class StructuredOutputsVerifyResponse(BaseVerifyResponse):
     tool_name_style: Optional[str] = None
     distractor_style: Optional[str] = None
     tool_union_mode: Optional[str] = None
+    # [CUSTOM] Markdown code fence policy for text answers; None = "forbidden" if the prompt says so
+    # (see NO_FENCE_RE), else "optional".
+    code_block: Optional[Literal["required", "optional", "forbidden"]] = None
 
 
 class StructuredOutputsResourcesServer(SimpleResourcesServer):
@@ -226,8 +300,13 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
                 assistant_responses.append(content_item.text)
         response_text = "".join(assistant_responses)
 
+        code_block = body.code_block
+        if code_block is None:
+            params = body.responses_create_params
+            params = params.model_dump() if hasattr(params, "model_dump") else params
+            code_block = "forbidden" if prompt_forbids_code_fence(params) else "optional"
         reward, error_type, error_message = self.evaluate_structured_output_response(
-            schema_type, schema_str, response_text
+            schema_type, schema_str, response_text, code_block=code_block
         )
         return StructuredOutputsVerifyResponse(
             **body.model_dump(), reward=reward, error_type=error_type, error_message=error_message
@@ -315,6 +394,19 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
 
         schema_type = schema["type"]
 
+        # Nullable/union types, e.g. ["integer", "null"]: an empty tag is null when
+        # allowed, otherwise use the first type the value coerces to (as for CSV).
+        if isinstance(schema_type, list):
+            if data is None and "null" in schema_type:
+                return None
+            for t in schema_type:
+                if t == "null":
+                    continue
+                result = self.coerce_xml_types(data, {**schema, "type": t})
+                if result is not data or t == "string":
+                    return result
+            return data
+
         if schema_type == "object" and isinstance(data, dict):
             properties = schema.get("properties", {})
             coerced = {}
@@ -363,25 +455,29 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
 
         return data
 
-    def coerce_csv_types(self, rows: List[Dict[str, str]], schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def coerce_csv_types(self, rows: Any, schema: Dict[str, Any]) -> Any:
         """Coerce CSV string values to match JSON Schema types.
 
         csv.DictReader returns all values as strings.  Walk rows alongside the
         items schema and convert values where possible.  On conversion failure
         the original string is kept so that schema validation reports the error.
+        `rows` is a list of rows for an array schema, or a single row (dict) for an
+        object schema.
         """
+        if isinstance(rows, dict):
+            return self._coerce_csv_row(rows, schema.get("properties", {}))
+
         items_schema = schema.get("items", schema)
         properties = items_schema.get("properties", {})
+        return [self._coerce_csv_row(row, properties) for row in rows]
 
-        coerced_rows = []
-        for row in rows:
-            coerced: Dict[str, Any] = {}
-            for key, value in row.items():
-                prop_schema = properties.get(key, {})
-                prop_type = prop_schema.get("type", "string")
-                coerced[key] = self._coerce_csv_scalar(value, prop_type)
-            coerced_rows.append(coerced)
-        return coerced_rows
+    def _coerce_csv_row(self, row: Dict[str, str], properties: Dict[str, Any]) -> Dict[str, Any]:
+        coerced: Dict[str, Any] = {}
+        for key, value in row.items():
+            prop_schema = properties.get(key, {})
+            prop_type = prop_schema.get("type", "string")
+            coerced[key] = self._coerce_csv_scalar(value, prop_type)
+        return coerced
 
     def _coerce_csv_scalar(self, value: str, target_type) -> Any:
         """Coerce a single CSV string to the target JSON Schema type."""
@@ -410,6 +506,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
                     return True
                 if lower in ("false", "0"):
                     return False
+            # CSV cells are flat, so nested arrays/objects can only be written as JSON.
+            if target_type in ("array", "object"):
+                decoded = json.loads(value)
+                if isinstance(decoded, list if target_type == "array" else dict):
+                    return decoded
         except (ValueError, AttributeError):
             pass
         return value
@@ -432,11 +533,28 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
             return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
 
     def evaluate_structured_output_response(
-        self, schema_type: SchemaType, schema_str: str, response_text: str
+        self, schema_type: SchemaType, schema_str: str, response_text: str, code_block: str = "forbidden"
     ) -> Tuple[float, Optional[str], Optional[str]]:
         """Returns (reward, error_type, error_message)."""
-        if not response_text or not response_text.strip():
+        # [CUSTOM] The answer arrives with the chat template's separator after </think> ("\n\n").
+        # Surrounding whitespace means nothing in any format, but a leading blank line makes
+        # csv.DictReader read an empty header, so every CSV answer used to score 0.
+        response_text = response_text.strip() if response_text else response_text
+        if not response_text:
             return 0.0, "empty_response", "No assistant response text"
+
+        # [CUSTOM] Code fence policy (see split_code_fence). The default "forbidden" keeps direct callers'
+        # old behaviour, where a fenced answer failed to parse.
+        fence = split_code_fence(response_text)
+        if fence is not None:
+            language, fenced_body = fence
+            if code_block == "forbidden":
+                return 0.0, "code_block_forbidden", "The prompt asked for no code fence"
+            if language and language not in FENCE_LANGUAGES.get(schema_type.lower(), {language}):
+                return 0.0, "code_block_language", f"```{language} fence for a {schema_type} request"
+            response_text = fenced_body.strip()
+        elif code_block == "required":
+            return 0.0, "code_block_missing", "The prompt asked for a fenced code block"
 
         try:
             schema = json.loads(schema_str)
@@ -450,15 +568,53 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         except Exception as e:
             return 0.0, "parse_error", f"{type(e).__name__}: {str(e)[:200]}"
 
-        try:
-            if schema_type == SchemaType.XML and self.config.xml_coerce_types:
-                response_obj = self.coerce_xml_types(response_obj, schema)
-            if schema_type == SchemaType.CSV:
-                response_obj = self.coerce_csv_types(response_obj, schema)
-            validate_against_schema_openapi(response_obj, schema)
-            return 1.0, None, None
-        except Exception as e:
-            return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
+        # [CUSTOM] JSON parses as YAML, so without this a JSON answer to a YAML request passed:
+        # in C6/C7 validation such answers grew from ~5/78 to 40-52/78 YAML prompts by step 430-440,
+        # and ifstruct (which rejects them) fell 0.61 -> 0.49 on YAML. Same rule as ifstruct.
+        if schema_type.lower() == SchemaType.YAML and is_flow_style_yaml(response_text):
+            return 0.0, "json_as_yaml", "Flow-style (JSON) output for a YAML request; write block-style YAML"
+
+        candidates = self.candidate_objects(schema_type, response_obj, schema)
+        if not candidates:
+            return 0.0, "validation_error", "CSV for an object schema must have exactly one data row"
+
+        # Report the last reading's error: it is the most lenient one tried.
+        error = None
+        for candidate in candidates:
+            try:
+                if schema_type == SchemaType.XML and self.config.xml_coerce_types:
+                    candidate = self.coerce_xml_types(candidate, schema)
+                if schema_type == SchemaType.CSV:
+                    candidate = self.coerce_csv_types(candidate, schema)
+                validate_against_schema_openapi(candidate, schema)
+                return 1.0, None, None
+            except Exception as e:
+                error = f"{type(e).__name__}: {str(e)[:200]}"
+        return 0.0, "validation_error", error
+
+    def candidate_objects(self, schema_type: SchemaType, response_obj: Any, schema: Dict[str, Any]) -> List[Any]:
+        """Readings of a parsed document to validate, in order; any one passing is a pass.
+
+        Some formats cannot express every schema's top level as-is:
+        - XML always has exactly one root element, which xmltodict keeps as a
+          wrapping key ({"person": {...}}). Try the document as-is first (the schema
+          may name the root), then with the root unwrapped.
+        - TOML's top level is always a table, so an array schema can only be
+          written as a single key holding the array (e.g. [[items]]).
+        - CSV is a list of rows; an object schema is written as a single data row.
+        """
+        top_type = schema.get("type")
+        single_value = (
+            next(iter(response_obj.values())) if isinstance(response_obj, dict) and len(response_obj) == 1 else None
+        )
+
+        if schema_type == SchemaType.XML and single_value is not None:
+            return [response_obj, single_value]
+        if schema_type == SchemaType.TOML and top_type == "array" and isinstance(single_value, list):
+            return [single_value]
+        if schema_type == SchemaType.CSV and top_type == "object":
+            return [response_obj[0]] if len(response_obj) == 1 else []
+        return [response_obj]
 
 
 if __name__ == "__main__":

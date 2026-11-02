@@ -334,11 +334,13 @@ class TestApp:
             expected_answers=[{"name": "get_weather", "arguments": {"city": "San Francisco"}}],
         )
 
+        # [CUSTOM] As in BFCL, an argument beyond the label fails unless it repeats the schema default
+        # (no tools here, so no defaults).
         result = await server.verify(verify_request)
-        assert result.reward == 1.0
+        assert result.reward == 0.0
         assert result.num_expected == 1
         assert result.num_predicted == 1
-        assert result.num_correct == 1
+        assert result.num_correct == 0
 
     async def test_verify_no_expected_no_predicted(self) -> None:
         response = NeMoGymResponse(

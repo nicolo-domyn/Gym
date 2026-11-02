@@ -38,6 +38,14 @@ ns_tools:
       sandbox_host: ${oc.env:NEMO_SKILLS_SANDBOX_HOST,127.0.0.1}
       sandbox_port: ${oc.env:NEMO_SKILLS_SANDBOX_PORT,6000}
 
+      # If set (launch.sh sets both), nemo_gym.sandbox_launcher.ensure_sandbox() launches the
+      # sandbox itself inside a Singularity container (see
+      # docs/infrastructure/engineering-notes/sandbox-container-granularity.md). Empty by
+      # default here so `ng_run` invoked directly (not via launch.sh) still works against a
+      # manually-started sandbox, same as before this existed.
+      sandbox_sif_path: ${oc.env:NEMO_SKILLS_SANDBOX_SIF_PATH,""}
+      sandbox_venv_path: ${oc.env:NEMO_SKILLS_SANDBOX_VENV_PATH,""}
+
       # Disable session replay after sandbox worker restarts (improves stability)
       disable_session_restore: true
       
