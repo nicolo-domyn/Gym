@@ -23,7 +23,7 @@ math_with_judge:
       format_penalty: 0.5
       # Grade only the last ANSWER: line (its content wrapped in \boxed{}) when the
       # system prompt asks for one and the response has it, instead of the whole response.
-      grade_answer_line: false
+      grade_answer_line: true
       domain: math
       verified: false
       description: OpenMathReasoning math dataset with math-verify and LLM-as-a-judge
