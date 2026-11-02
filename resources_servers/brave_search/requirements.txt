@@ -1,5 +1,7 @@
 -e nemo-gym[dev] @ ../../
 trafilatura==2.0.0
 mcp==1.12.3
-# Optional distributed rate limiter (rate_limiter.py) -- backs rate_limiter_enabled: true.
+# Optional distributed rate limiter -- backs rate_limiter_enabled: true. The RateLimiter class
+# itself is loaded directly from nemo_rl/utils/rate_limiter.py (see app.py's
+# _load_rate_limiter_class), not vendored here; this just provides its runtime dependency.
 redis==5.2.1

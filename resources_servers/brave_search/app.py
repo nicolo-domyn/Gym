@@ -15,6 +15,7 @@ docs/infrastructure/engineering-notes/aiohttp-vs-httpx.md. google_search's use o
 `requests` for the same reason is a precedent for this kind of low-volume exception.
 """
 
+import importlib.util
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ import subprocess
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import httpx
 import trafilatura
@@ -38,10 +39,50 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
-from rate_limiter import RateLimiter
+
+
+if TYPE_CHECKING:
+    # Only for static type checkers -- never executed at runtime, so this never triggers
+    # nemo_rl's package-level import side effects. See `_load_rate_limiter_class()` below
+    # for how the real class is loaded at runtime.
+    from nemo_rl.utils.rate_limiter import RateLimiter
 
 
 logger = logging.getLogger(__name__)
+
+
+def _load_rate_limiter_class() -> type:
+    """Load nemo_rl's `RateLimiter` directly from its source file, bypassing `nemo_rl` as a
+    package.
+
+    This resources server builds its own isolated venv and has no normal import path to
+    `nemo_rl`. We  deliberately do not do `import nemo_rl.utils.rate_limiter` (even 
+    with `nemo_rl` on `sys.path`): importing the `nemo_rl` package runs 
+    `nemo_rl/__init__.py`'s module-level side effects (reconfiguring the root logger via
+    `logging.basicConfig()`, a container fingerprint check, a nsight.py patch, etc.), none
+    of which this process has any reason to inherit.
+    Instead, load just the one file via `importlib.util`, which has zero intra-package
+    imports and is fully standalone.
+
+    Only called from the `rate_limiter_enabled` branch below, so this import is attempted --
+    and can only fail -- when the feature is actually in use.
+    """
+    this_file = Path(__file__).resolve()
+    # this_file is .../RL/3rdparty/Gym-workspace/Gym/resources_servers/brave_search/app.py
+    # parents[5] walks up: brave_search -> resources_servers -> Gym -> Gym-workspace ->
+    # 3rdparty -> RL.
+    rl_root = this_file.parents[5]
+    rate_limiter_path = rl_root / "nemo_rl" / "utils" / "rate_limiter.py"
+    if not rate_limiter_path.is_file():
+        raise FileNotFoundError(
+            f"rate_limiter_enabled=true but could not find nemo_rl's rate_limiter.py at the "
+            f"expected path {rate_limiter_path}. This resources server expects to be running "
+            "as part of RL's own Gym submodule (RL/3rdparty/Gym-workspace/Gym)."
+        )
+    spec = importlib.util.spec_from_file_location("_brave_search_nemo_rl_rate_limiter", rate_limiter_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RateLimiter
 
 
 class BraveSearchResourcesServerConfig(BaseResourcesServerConfig):
@@ -146,7 +187,7 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
     _mcp_exit_stack: Optional[AsyncExitStack] = None
     _mcp_session: Optional[ClientSession] = None
     _mcp_process: Optional[subprocess.Popen] = None
-    _rate_limiter: Optional[RateLimiter] = None
+    _rate_limiter: Optional["RateLimiter"] = None
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -154,6 +195,7 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
         if self.config.rate_limiter_enabled:
             if not self.config.redis_host:
                 raise ValueError("rate_limiter_enabled=true requires redis_host to be set.")
+            RateLimiter = _load_rate_limiter_class()
             self._rate_limiter = RateLimiter(
                 redis_host=self.config.redis_host,
                 redis_port=self.config.redis_port,

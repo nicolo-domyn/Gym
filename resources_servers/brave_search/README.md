@@ -79,8 +79,9 @@ started on a network-enabled node) instead of local-spawn.
 
 Enabled by default (`rate_limiter_enabled: true` in `configs/brave_search.yaml`, currently
 set to Brave's own 30 requests/second limit). Backed by a distributed Redis-based limiter
-(`rate_limiter.py`, a vendored copy of `nemo_rl/utils/rate_limiter.py`) so the limit is
-enforced across every worker/node, not just locally. Requires:
+(`RateLimiter`, loaded directly from `nemo_rl/utils/rate_limiter.py` -- see `app.py`'s
+`_load_rate_limiter_class`) so the limit is enforced across every worker/node, not just
+locally. Requires:
 1. A `redis:` block with `enabled: true` in the training experiment YAML (see
    `nemo_rl/utils/redis_job.py`'s docstring) -- this submits the shared Redis SLURM job
    (`images/redis/submit.sh`) with walltime matched to the training run and exports its host
