@@ -45,6 +45,7 @@ from nemo_gym.server_utils import get_response_json
 
 
 class AnswerFormatRule(BaseModel):
+    """[CUSTOM] Answer format rule model for identifying the required answer format in the system prompt."""
     # Text searched as is (case-sensitive) in the system prompt, i.e. the system/developer messages.
     prompt_text: str
     # The format the response must then use:
@@ -61,7 +62,7 @@ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     should_use_judge: bool = True
     library_verifier_timeout_seconds: PositiveFloat = 10.0
     library_verifier_max_concurrency: PositiveInt = 32
-    # Answer format check. The response must use the format its system prompt asks for: the first rule whose
+    # [CUSTOM] Answer format check. The response must use the format its system prompt asks for: the first rule whose
     # prompt_text is in the system prompt gives it, reported as `required_answer_format`. `format_ok` tells
     # whether the response uses it. When no rule matches, the sample has no format check: format_ok is None.
     # The ANSWER: rule comes first because such prompts may also say that \boxed is not needed.
@@ -69,11 +70,12 @@ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
         AnswerFormatRule(prompt_text="ANSWER: $ANSWER", answer_format="answer_line"),
         AnswerFormatRule(prompt_text="\\boxed", answer_format="boxed"),
     ]
-    # When True, a response with format_ok False gets max(0, reward - format_penalty): a correct answer in the
+    # [CUSTOM] When True, a response with format_ok False gets max(0, reward - format_penalty): a correct answer in the
     # wrong format is penalized, a wrong answer stays at 0. Off by default, so the reward is unchanged.
     penalize_answer_format: bool = False
+    # [CUSTOM]
     format_penalty: float = Field(default=0.5, ge=0.0, le=1.0)
-    # When True, a response whose system prompt asks for an ANSWER: line and that has one is graded on its last
+    # [CUSTOM] When True, a response whose system prompt asks for an ANSWER: line and that has one is graded on its last
     # ANSWER: line only: its content wrapped in \boxed{} (after "ANSWER:", math-verify reads LaTeX only inside
     # $...$), then the line as written if that fails. Off by default: the whole response is graded.
     grade_answer_line: bool = False
@@ -98,8 +100,9 @@ class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
     extracted_answer: Optional[str]
     library_reward: float
     judge_evaluations: Optional[list[JudgeEvaluation]]
-    # Optional so that subclasses building their own verify response keep working.
+    # [CUSTOM] Optional so that subclasses building their own verify response keep working.
     format_ok: Optional[bool] = None
+    # [CUSTOM] List of required answer formats according to the system prompt.
     required_answer_format: Optional[Literal["boxed", "answer_line"]] = None
 
 
@@ -183,6 +186,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
     JUDGE_EQUAL_LABEL: ClassVar[str] = "[[A=B]]"
     JUDGE_NOT_EQUAL_LABEL: ClassVar[str] = "[[A!=B]]"
 
+    """[CUSTOM] Regular expressions and patterns for parsing and validating mathematical answers."""
     BOXED_START_PATTERN: ClassVar[re.Pattern] = re.compile(r"\\(?:boxed|fbox)\s*\{")
     ANSWER_LINE_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^[ \t>*_#]*(?:final[ \t]+)?answer[ \t*_]*:[ \t*]*(?P<content>.*)$", re.IGNORECASE | re.MULTILINE
@@ -244,6 +248,10 @@ Example output: "My final verdict is different [[A!=B]]"."""
                 assistant_responses.append(content_item.text)
 
         combined_response = "".join(assistant_responses)
+        
+        #[CUSTOM] Extract the required answer format (if any) from the system prompt
+        # and check if the combined response matches it.
+        # For aime-like prompts, the user may wish to wrap only the value within \boxed{} to avoid verifier errors.
         required_answer_format = self._required_answer_format(body.responses_create_params)
         format_ok = None
         if required_answer_format is not None:
@@ -251,6 +259,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         generated_answer = combined_response
         if self.config.grade_answer_line and required_answer_format == "answer_line" and format_ok:
             generated_answer = self._answer_line_to_grade(body.expected_answer, combined_response)
+        
         (
             reward,
             extracted_answer,
@@ -265,12 +274,13 @@ Example output: "My final verdict is different [[A!=B]]"."""
             extracted_answer=extracted_answer,
             library_reward=library_reward,
             judge_evaluations=judge_evaluations,
+            # [CUSTOM]
             format_ok=format_ok,
             required_answer_format=required_answer_format,
         )
 
     def _required_answer_format(self, params: NeMoGymResponseCreateParamsNonStreaming) -> Optional[str]:
-        """The answer format the system prompt asks for, from the first matching answer_format_rules entry."""
+        """[CUSTOM] The answer format the system prompt asks for, from the first matching answer_format_rules entry."""
         system_prompt = self._system_prompt(params)
         for rule in self.config.answer_format_rules:
             if rule.prompt_text in system_prompt:
@@ -279,7 +289,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @staticmethod
     def _system_prompt(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
-        """Text of the system/developer messages of the request.
+        """[CUSTOM] Text of the system/developer messages of the request.
 
         `instructions` is left out: vllm_model does not send it to the model, so it cannot ask for a format.
         """
@@ -295,13 +305,13 @@ Example output: "My final verdict is different [[A!=B]]"."""
         return "\n".join(texts)
 
     def _has_answer_format(self, text: str, answer_format: str) -> bool:
-        """Whether the response gives its answer in the given format."""
+        """[CUSTOM] Whether the response gives its answer in the given format."""
         if answer_format == "boxed":
             return self._has_closed_boxed(text)
         return self.ANSWER_LINE_PATTERN.search(text) is not None
 
     def _answer_line_to_grade(self, expected_answer: str, text: str) -> str:
-        """The part of a response answering on an "ANSWER:" line that gets graded.
+        """[CUSTOM] The part of a response answering on an "ANSWER:" line that gets graded.
 
         The line content wrapped in \\boxed{} when math-verify accepts it there, otherwise the line as
         written. The rest of the response is never graded, so a number elsewhere in it cannot match.
@@ -313,7 +323,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @classmethod
     def _extract_answer_line(cls, text: str) -> str:
-        """Content of the last "ANSWER:" line, or of the next non-empty line when nothing follows the colon.
+        """[CUSTOM] Content of the last "ANSWER:" line, or of the next non-empty line when nothing follows the colon.
 
         When that content only opens display math ("\\[" or "$$"), the whole block up to its closing delimiter.
         """
@@ -334,7 +344,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @classmethod
     def _normalize_answer_line(cls, content: str) -> str:
-        """Drop special tokens, markdown emphasis, a repeated "ANSWER:", outer or unpaired math delimiters and
+        """[CUSTOM] Drop special tokens, markdown emphasis, a repeated "ANSWER:", outer or unpaired math delimiters and
         trailing punctuation, and rewrite unicode math and \\big-style size modifiers as LaTeX."""
         content = cls.SPECIAL_TOKEN_PATTERN.sub("", content).strip()
         content = cls.UNICODE_SQRT_PATTERN.sub(lambda m: "\\sqrt{" + cls._strip_group(m.group(1)) + "}", content)
@@ -365,12 +375,12 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @staticmethod
     def _strip_group(group: str) -> str:
-        """The inside of a (...) or {...} group, or the group itself."""
+        """[CUSTOM] The inside of a (...) or {...} group, or the group itself."""
         return group[1:-1].strip() if group[:1] in "({" else group
 
     @classmethod
     def _unwrap_nested_answer(cls, content: str) -> str:
-        """Drop a second "ANSWER:" at the start, also when \\text{...} wraps it together with the answer."""
+        """[CUSTOM] Drop a second "ANSWER:" at the start, also when \\text{...} wraps it together with the answer."""
         match = cls.TEXT_WRAPPER_PATTERN.match(content)
         if match is not None and content.endswith("}") and cls.NESTED_ANSWER_PATTERN.match(content[match.end() :]):
             depth = 0
@@ -384,7 +394,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @classmethod
     def _strip_unpaired_delimiter(cls, content: str) -> str:
-        """Drop a math delimiter at either end whose pair is missing, e.g. "1+3\\sqrt{2}\\)"."""
+        """[CUSTOM] Drop a math delimiter at either end whose pair is missing, e.g. "1+3\\sqrt{2}\\)"."""
         for left, right in cls.MATH_DELIMITERS:
             if left == right:
                 if content.count(left) != 1:
@@ -401,7 +411,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @classmethod
     def _has_closed_boxed(cls, text: str) -> bool:
-        # A \boxed{ whose braces never balance (e.g. the output was cut) does not count.
+        """[CUSTOM] A \boxed{ whose braces never balance (e.g. the output was cut) does not count."""
         for match in cls.BOXED_START_PATTERN.finditer(text):
             depth = 0
             for char in text[match.end() - 1 :]:
