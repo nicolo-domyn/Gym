@@ -73,7 +73,6 @@ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     # [CUSTOM] When True, a response with format_ok False gets max(0, reward - format_penalty): a correct answer in the
     # wrong format is penalized, a wrong answer stays at 0. Off by default, so the reward is unchanged.
     penalize_answer_format: bool = False
-    # [CUSTOM]
     format_penalty: float = Field(default=0.5, ge=0.0, le=1.0)
     # [CUSTOM] When True, a response whose system prompt asks for an ANSWER: line and that has one is graded on its last
     # ANSWER: line only: its content wrapped in \boxed{} (after "ANSWER:", math-verify reads LaTeX only inside
@@ -273,7 +272,6 @@ Example output: "My final verdict is different [[A!=B]]"."""
             extracted_answer=extracted_answer,
             library_reward=library_reward,
             judge_evaluations=judge_evaluations,
-            # [CUSTOM]
             format_ok=format_ok,
             required_answer_format=required_answer_format,
         )
