@@ -46,6 +46,7 @@ from nemo_gym.server_utils import get_response_json
 
 class AnswerFormatRule(BaseModel):
     """[CUSTOM] Answer format rule model for identifying the required answer format in the system prompt."""
+
     # Text searched as is (case-sensitive) in the system prompt, i.e. the system/developer messages.
     prompt_text: str
     # The format the response must then use:
@@ -53,7 +54,6 @@ class AnswerFormatRule(BaseModel):
     #   - "answer_line": a line starting with "ANSWER:" in any case, optionally after markdown markers
     #     or "Final", e.g. "ANSWER: 5", "**Answer:** 5", "Final answer: 5".
     answer_format: Literal["boxed", "answer_line"]
-
 
 
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
@@ -102,7 +102,7 @@ class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
     judge_evaluations: Optional[list[JudgeEvaluation]]
     # [CUSTOM] Optional so that subclasses building their own verify response keep working.
     format_ok: Optional[bool] = None
-    # [CUSTOM] List of required answer formats according to the system prompt.
+    # [CUSTOM] Optional list of required answer formats according to the system prompt.
     required_answer_format: Optional[Literal["boxed", "answer_line"]] = None
 
 
@@ -186,7 +186,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
     JUDGE_EQUAL_LABEL: ClassVar[str] = "[[A=B]]"
     JUDGE_NOT_EQUAL_LABEL: ClassVar[str] = "[[A!=B]]"
 
-    """[CUSTOM] Regular expressions and patterns for parsing and validating mathematical answers."""
+    # [CUSTOM] Regular expressions and patterns for parsing and validating mathematical answers.
     BOXED_START_PATTERN: ClassVar[re.Pattern] = re.compile(r"\\(?:boxed|fbox)\s*\{")
     ANSWER_LINE_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"^[ \t>*_#]*(?:final[ \t]+)?answer[ \t*_]*:[ \t*]*(?P<content>.*)$", re.IGNORECASE | re.MULTILINE
@@ -214,7 +214,6 @@ Example output: "My final verdict is different [[A!=B]]"."""
     NESTED_ANSWER_PATTERN: ClassVar[re.Pattern] = re.compile(r"^(?:final[ \t]+)?answer[ \t]*:[ \t]*", re.IGNORECASE)
     DISPLAYSTYLE_PATTERN: ClassVar[re.Pattern] = re.compile(r"^\\displaystyle(?![A-Za-z])\s*")
     TEXT_WRAPPER_PATTERN: ClassVar[re.Pattern] = re.compile(r"^\\(?:text|textbf|mathrm|mathbf)\s*\{")
-
 
     config: LibraryJudgeMathResourcesServerConfig
 
@@ -248,8 +247,8 @@ Example output: "My final verdict is different [[A!=B]]"."""
                 assistant_responses.append(content_item.text)
 
         combined_response = "".join(assistant_responses)
-        
-        #[CUSTOM] Extract the required answer format (if any) from the system prompt
+
+        # [CUSTOM] Extract the required answer format (if any) from the system prompt
         # and check if the combined response matches it.
         # For aime-like prompts, the user may wish to wrap only the value within \boxed{} to avoid verifier errors.
         required_answer_format = self._required_answer_format(body.responses_create_params)
@@ -258,8 +257,8 @@ Example output: "My final verdict is different [[A!=B]]"."""
             format_ok = self._has_answer_format(combined_response, required_answer_format)
         generated_answer = combined_response
         if self.config.grade_answer_line and required_answer_format == "answer_line" and format_ok:
-            generated_answer = self._answer_line_to_grade(body.expected_answer, combined_response)
-        
+            generated_answer = await self._answer_line_to_grade(body.expected_answer, combined_response)
+
         (
             reward,
             extracted_answer,
@@ -310,7 +309,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
             return self._has_closed_boxed(text)
         return self.ANSWER_LINE_PATTERN.search(text) is not None
 
-    def _answer_line_to_grade(self, expected_answer: str, text: str) -> str:
+    async def _answer_line_to_grade(self, expected_answer: str, text: str) -> str:
         """[CUSTOM] The part of a response answering on an "ANSWER:" line that gets graded.
 
         The line content wrapped in \\boxed{} when math-verify accepts it there, otherwise the line as
@@ -318,7 +317,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         """
         content = self._extract_answer_line(text)
         boxed_answer = "\\boxed{" + self._normalize_answer_line(content) + "}"
-        library_reward, _ = self._verify_answer_with_library(expected_answer, boxed_answer)
+        library_reward, _ = await self._verify_answer_with_library_async(expected_answer, boxed_answer)
         return boxed_answer if library_reward > 0.5 else "ANSWER: " + content
 
     @classmethod
@@ -411,7 +410,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     @classmethod
     def _has_closed_boxed(cls, text: str) -> bool:
-        """[CUSTOM] A \boxed{ whose braces never balance (e.g. the output was cut) does not count."""
+        """[CUSTOM] A \\boxed{ whose braces never balance (e.g. the output was cut) does not count."""
         for match in cls.BOXED_START_PATTERN.finditer(text):
             depth = 0
             for char in text[match.end() - 1 :]:
