@@ -16,15 +16,16 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing as mp
+import re
 from io import StringIO
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 from fastapi import FastAPI
 from math_verify import grader
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
-from pydantic import BaseModel, PositiveFloat, PositiveInt
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -43,12 +44,40 @@ from nemo_gym.reward_profile import compute_pass_majority_metrics, highest_k_met
 from nemo_gym.server_utils import get_response_json
 
 
+class AnswerFormatRule(BaseModel):
+    """[CUSTOM] Answer format rule model for identifying the required answer format in the system prompt."""
+
+    # Text searched as is (case-sensitive) in the system prompt, i.e. the system/developer messages.
+    prompt_text: str
+    # The format the response must then use:
+    #   - "boxed": a closed \boxed{...} (or \fbox{...});
+    #   - "answer_line": a line starting with "ANSWER:" in any case, optionally after markdown markers
+    #     or "Final", e.g. "ANSWER: 5", "**Answer:** 5", "Final answer: 5".
+    answer_format: Literal["boxed", "answer_line"]
+
+
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     should_use_judge: bool = True
     library_verifier_timeout_seconds: PositiveFloat = 10.0
     library_verifier_max_concurrency: PositiveInt = 32
+    # [CUSTOM] Answer format check. The response must use the format its system prompt asks for: the first rule whose
+    # prompt_text is in the system prompt gives it, reported as `required_answer_format`. `format_ok` tells
+    # whether the response uses it. When no rule matches, the sample has no format check: format_ok is None.
+    # The ANSWER: rule comes first because such prompts may also say that \boxed is not needed.
+    answer_format_rules: List[AnswerFormatRule] = [
+        AnswerFormatRule(prompt_text="ANSWER: $ANSWER", answer_format="answer_line"),
+        AnswerFormatRule(prompt_text="\\boxed", answer_format="boxed"),
+    ]
+    # [CUSTOM] When True, a response with format_ok False gets max(0, reward - format_penalty): a correct answer in the
+    # wrong format is penalized, a wrong answer stays at 0. Off by default, so the reward is unchanged.
+    penalize_answer_format: bool = False
+    format_penalty: float = Field(default=0.5, ge=0.0, le=1.0)
+    # [CUSTOM] When True, a response whose system prompt asks for an ANSWER: line and that has one is graded on its last
+    # ANSWER: line only: its content wrapped in \boxed{} (after "ANSWER:", math-verify reads LaTeX only inside
+    # $...$), then the line as written if that fails. Off by default: the whole response is graded.
+    grade_answer_line: bool = False
 
 
 class LibraryJudgeMathRunRequest(BaseRunRequest):
@@ -70,6 +99,10 @@ class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
     extracted_answer: Optional[str]
     library_reward: float
     judge_evaluations: Optional[list[JudgeEvaluation]]
+    # [CUSTOM] Optional so that subclasses building their own verify response keep working.
+    format_ok: Optional[bool] = None
+    # [CUSTOM] Optional list of required answer formats according to the system prompt.
+    required_answer_format: Optional[Literal["boxed", "answer_line"]] = None
 
 
 def _run_math_verify(
@@ -152,6 +185,35 @@ Example output: "My final verdict is different [[A!=B]]"."""
     JUDGE_EQUAL_LABEL: ClassVar[str] = "[[A=B]]"
     JUDGE_NOT_EQUAL_LABEL: ClassVar[str] = "[[A!=B]]"
 
+    # [CUSTOM] Regular expressions and patterns for parsing and validating mathematical answers.
+    BOXED_START_PATTERN: ClassVar[re.Pattern] = re.compile(r"\\(?:boxed|fbox)\s*\{")
+    ANSWER_LINE_PATTERN: ClassVar[re.Pattern] = re.compile(
+        r"^[ \t>*_#]*(?:final[ \t]+)?answer[ \t*_]*:[ \t*]*(?P<content>.*)$", re.IGNORECASE | re.MULTILINE
+    )
+    # Special tokens such as <|im_end|> left at the end of the generation. Only token-like names at the end of
+    # the line, so that math such as "0<|x|>1" or "<|x - 1|>" is kept.
+    SPECIAL_TOKEN_PATTERN: ClassVar[re.Pattern] = re.compile(r"(?:\s*<\|[A-Za-z][A-Za-z0-9_]{2,}\|>)+\s*$")
+    # A trailing sentence period or separator, but not LaTeX spacing such as "\,".
+    TRAILING_PUNCTUATION_PATTERN: ClassVar[re.Pattern] = re.compile(r"(?<!\\)[.,;:]\s*$")
+    MATH_DELIMITERS: ClassVar[tuple[tuple[str, str], ...]] = (("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$"))
+    # Display math opened on the ANSWER: line (or the line after it) and closed on a later line.
+    DISPLAY_MATH_DELIMITERS: ClassVar[dict[str, str]] = {"\\[": "\\]", "$$": "$$"}
+    # Unicode math that math-verify does not read, e.g. "2√5/5", "−3" or "2π".
+    UNICODE_SQRT_PATTERN: ClassVar[re.Pattern] = re.compile(r"√\s*(\d+(?:\.\d+)?|[A-Za-z]|\{[^{}]*\}|\([^()]*\))")
+    UNICODE_SYMBOLS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("−", "-"),
+        ("×", "\\times "),
+        ("·", "\\cdot "),
+        ("π", "\\pi "),
+    )
+    # \big, \Bigl, \biggr, ... size modifiers, which math-verify does not read: "\big\lfloor x \big\rfloor".
+    SIZE_MODIFIER_PATTERN: ClassVar[re.Pattern] = re.compile(r"\\[Bb]igg?[lrm]?(?![A-Za-z])")
+    # A second "ANSWER:" inside the line, e.g. "**Final answer:** \(ANSWER: \frac{1}{8}\)", possibly behind
+    # \displaystyle or inside \text{...}.
+    NESTED_ANSWER_PATTERN: ClassVar[re.Pattern] = re.compile(r"^(?:final[ \t]+)?answer[ \t]*:[ \t]*", re.IGNORECASE)
+    DISPLAYSTYLE_PATTERN: ClassVar[re.Pattern] = re.compile(r"^\\displaystyle(?![A-Za-z])\s*")
+    TEXT_WRAPPER_PATTERN: ClassVar[re.Pattern] = re.compile(r"^\\(?:text|textbf|mathrm|mathbf)\s*\{")
+
     config: LibraryJudgeMathResourcesServerConfig
 
     def model_post_init(self, context: Any) -> None:
@@ -184,19 +246,179 @@ Example output: "My final verdict is different [[A!=B]]"."""
                 assistant_responses.append(content_item.text)
 
         combined_response = "".join(assistant_responses)
+
+        # [CUSTOM] Extract the required answer format (if any) from the system prompt
+        # and check if the combined response matches it.
+        # For aime-like prompts, the user may wish to wrap only the value within \boxed{} to avoid verifier errors.
+        required_answer_format = self._required_answer_format(body.responses_create_params)
+        format_ok = None
+        if required_answer_format is not None:
+            format_ok = self._has_answer_format(combined_response, required_answer_format)
+        generated_answer = combined_response
+        if self.config.grade_answer_line and required_answer_format == "answer_line" and format_ok:
+            generated_answer = await self._answer_line_to_grade(body.expected_answer, combined_response)
+
         (
             reward,
             extracted_answer,
             library_reward,
             judge_evaluations,
-        ) = await self._verify_answer(body.question, body.expected_answer, combined_response)
+        ) = await self._verify_answer(body.question, body.expected_answer, generated_answer)
+        if self.config.penalize_answer_format and format_ok is False:
+            reward = max(0.0, reward - self.config.format_penalty)
         return LibraryJudgeMathVerifyResponse(
             **body.model_dump(),
             reward=reward,
             extracted_answer=extracted_answer,
             library_reward=library_reward,
             judge_evaluations=judge_evaluations,
+            format_ok=format_ok,
+            required_answer_format=required_answer_format,
         )
+
+    def _required_answer_format(self, params: NeMoGymResponseCreateParamsNonStreaming) -> Optional[str]:
+        """[CUSTOM] The answer format the system prompt asks for, from the first matching answer_format_rules entry."""
+        system_prompt = self._system_prompt(params)
+        for rule in self.config.answer_format_rules:
+            if rule.prompt_text in system_prompt:
+                return rule.answer_format
+        return None
+
+    @staticmethod
+    def _system_prompt(params: NeMoGymResponseCreateParamsNonStreaming) -> str:
+        """[CUSTOM] Text of the system/developer messages of the request.
+
+        `instructions` is left out: vllm_model does not send it to the model, so it cannot ask for a format.
+        """
+        texts = []
+        if not isinstance(params.input, str):
+            for item in params.input:
+                if getattr(item, "role", None) not in ("system", "developer"):
+                    continue
+                if isinstance(item.content, str):
+                    texts.append(item.content)
+                else:
+                    texts.extend(part.get("text") or "" for part in item.content if isinstance(part, dict))
+        return "\n".join(texts)
+
+    def _has_answer_format(self, text: str, answer_format: str) -> bool:
+        """[CUSTOM] Whether the response gives its answer in the given format."""
+        if answer_format == "boxed":
+            return self._has_closed_boxed(text)
+        return self.ANSWER_LINE_PATTERN.search(text) is not None
+
+    async def _answer_line_to_grade(self, expected_answer: str, text: str) -> str:
+        """[CUSTOM] The part of a response answering on an "ANSWER:" line that gets graded.
+
+        The line content wrapped in \\boxed{} when math-verify accepts it there, otherwise the line as
+        written. The rest of the response is never graded, so a number elsewhere in it cannot match.
+        """
+        content = self._extract_answer_line(text)
+        boxed_answer = "\\boxed{" + self._normalize_answer_line(content) + "}"
+        library_reward, _ = await self._verify_answer_with_library_async(expected_answer, boxed_answer)
+        return boxed_answer if library_reward > 0.5 else "ANSWER: " + content
+
+    @classmethod
+    def _extract_answer_line(cls, text: str) -> str:
+        """[CUSTOM] Content of the last "ANSWER:" line, or of the next non-empty line when nothing follows the colon.
+
+        When that content only opens display math ("\\[" or "$$"), the whole block up to its closing delimiter.
+        """
+        match = list(cls.ANSWER_LINE_PATTERN.finditer(text))[-1]
+        content = match.group("content")
+        following_lines = iter(text[match.end() :].splitlines())
+        if not content.strip():
+            content = next((line for line in following_lines if line.strip()), "")
+        closing = cls.DISPLAY_MATH_DELIMITERS.get(content.strip())
+        if closing is not None:
+            block = [content.strip()]
+            for line in following_lines:
+                block.append(line.strip())
+                if closing in line:
+                    break
+            content = " ".join(part for part in block if part)
+        return content.strip()
+
+    @classmethod
+    def _normalize_answer_line(cls, content: str) -> str:
+        """[CUSTOM] Drop special tokens, markdown emphasis, a repeated "ANSWER:", outer or unpaired math delimiters and
+        trailing punctuation, and rewrite unicode math and \\big-style size modifiers as LaTeX."""
+        content = cls.SPECIAL_TOKEN_PATTERN.sub("", content).strip()
+        content = cls.UNICODE_SQRT_PATTERN.sub(lambda m: "\\sqrt{" + cls._strip_group(m.group(1)) + "}", content)
+        for symbol, latex in cls.UNICODE_SYMBOLS:
+            content = content.replace(symbol, latex)
+        content = cls.SIZE_MODIFIER_PATTERN.sub("", content)
+        previous = None
+        while content != previous:
+            previous = content
+            content = content.strip("*`").strip()
+            content = cls.TRAILING_PUNCTUATION_PATTERN.sub("", content).strip()
+            content = cls.DISPLAYSTYLE_PATTERN.sub("", content)
+            content = cls._unwrap_nested_answer(content)
+            for left, right in cls.MATH_DELIMITERS:
+                inner = content[len(left) : -len(right)]
+                if (
+                    content.startswith(left)
+                    and content.endswith(right)
+                    and inner.strip()
+                    and left not in inner
+                    and right not in inner
+                ):
+                    content = inner.strip()
+                    break
+            else:
+                content = cls._strip_unpaired_delimiter(content)
+        return content
+
+    @staticmethod
+    def _strip_group(group: str) -> str:
+        """[CUSTOM] The inside of a (...) or {...} group, or the group itself."""
+        return group[1:-1].strip() if group[:1] in "({" else group
+
+    @classmethod
+    def _unwrap_nested_answer(cls, content: str) -> str:
+        """[CUSTOM] Drop a second "ANSWER:" at the start, also when \\text{...} wraps it together with the answer."""
+        match = cls.TEXT_WRAPPER_PATTERN.match(content)
+        if match is not None and content.endswith("}") and cls.NESTED_ANSWER_PATTERN.match(content[match.end() :]):
+            depth = 0
+            for index in range(match.end() - 1, len(content)):
+                depth += {"{": 1, "}": -1}.get(content[index], 0)
+                if depth == 0:
+                    break
+            if index == len(content) - 1:
+                content = content[match.end() : -1].strip()
+        return cls.NESTED_ANSWER_PATTERN.sub("", content)
+
+    @classmethod
+    def _strip_unpaired_delimiter(cls, content: str) -> str:
+        """[CUSTOM] Drop a math delimiter at either end whose pair is missing, e.g. "1+3\\sqrt{2}\\)"."""
+        for left, right in cls.MATH_DELIMITERS:
+            if left == right:
+                if content.count(left) != 1:
+                    continue
+                if content.startswith(left):
+                    return content[len(left) :].strip()
+                if content.endswith(right) and not content.endswith("\\" + right):
+                    return content[: -len(right)].strip()
+            elif content.endswith(right) and left not in content:
+                return content[: -len(right)].strip()
+            elif content.startswith(left) and right not in content:
+                return content[len(left) :].strip()
+        return content
+
+    @classmethod
+    def _has_closed_boxed(cls, text: str) -> bool:
+        """[CUSTOM] A \\boxed{ whose braces never balance (e.g. the output was cut) does not count."""
+        for match in cls.BOXED_START_PATTERN.finditer(text):
+            depth = 0
+            for char in text[match.end() - 1 :]:
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return True
+        return False
 
     async def _verify_answer(
         self, question: str, expected_answer: str, generated_answer: str
