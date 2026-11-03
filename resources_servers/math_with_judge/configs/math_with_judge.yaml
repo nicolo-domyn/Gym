@@ -9,7 +9,7 @@ math_with_judge:
         input: []
       }
       should_use_judge: false
-      # Answer format check: the response must use the format its system prompt asks
+      # [CUSTOM] Answer format check: the response must use the format its system prompt asks
       # for, given by the first rule whose prompt_text is in the system prompt; a sample
       # matching no rule has no format check (format_ok is None). With
       # penalize_answer_format, a response with format_ok false gets
@@ -21,7 +21,7 @@ math_with_judge:
           answer_format: boxed
       penalize_answer_format: false
       format_penalty: 0.5
-      # Grade only the last ANSWER: line (its content wrapped in \boxed{}) when the
+      # [CUSTOM] Grade only the last ANSWER: line (its content wrapped in \boxed{}) when the
       # system prompt asks for one and the response has it, instead of the whole response.
       grade_answer_line: false
       domain: math
