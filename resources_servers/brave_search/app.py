@@ -266,7 +266,15 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
                     "Check logs above for details."
                 )
             try:
-                with httpx.Client(timeout=2.0) as client:
+                # trust_env=False: this is a loopback call to our own just-spawned subprocess,
+                # never meant to leave the machine. Without it, httpx inherits HTTP_PROXY/
+                # HTTPS_PROXY when proxy.enabled=true and routes this through the forward proxy,
+                # which rejects it (squidward's Safe_ports ACL only allows 80/443, and our local
+                # MCP server binds an arbitrary port) -- confirmed via a real 403. NO_PROXY alone
+                # doesn't fix this: httpx's own NO_PROXY parsing doesn't do CIDR-range matching
+                # despite its docstring's claim, only exact IPs/"localhost" (confirmed
+                # empirically), so an explicit opt-out here is the only reliable fix.
+                with httpx.Client(timeout=2.0, trust_env=False) as client:
                     response = client.post(url, json={})
                 logger.info(f"Brave MCP server is ready (status: {response.status_code})")
                 return
@@ -294,10 +302,32 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
             self._mcp_process.kill()
         self._mcp_process = None
 
+    @staticmethod
+    def _mcp_http_client_factory(
+        headers: Optional[dict] = None,
+        timeout: Optional[httpx.Timeout] = None,
+        auth: Optional[httpx.Auth] = None,
+    ) -> httpx.AsyncClient:
+        # trust_env=False: this session talks only to our own just-spawned local MCP server,
+        # never meant to leave the machine -- see _wait_for_local_mcp_server_ready's own comment
+        # on why this matters and why NO_PROXY alone doesn't fix it for httpx. Reimplements
+        # create_mcp_http_client's own kwarg-building (can't just wrap it and mutate the result:
+        # httpx.AsyncClient resolves env proxies into its transport mounts once, in __init__ --
+        # trust_env is only a read-only property afterwards, setting it post-construction is a
+        # no-op for the already-built mounts).
+        kwargs: dict = {"trust_env": False}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if headers is not None:
+            kwargs["headers"] = headers
+        if auth is not None:
+            kwargs["auth"] = auth
+        return httpx.AsyncClient(**kwargs)
+
     async def _connect_mcp_session(self) -> None:
         self._mcp_exit_stack = AsyncExitStack()
         read_stream, write_stream, _ = await self._mcp_exit_stack.enter_async_context(
-            streamablehttp_client(self._mcp_url())
+            streamablehttp_client(self._mcp_url(), httpx_client_factory=self._mcp_http_client_factory)
         )
         session = await self._mcp_exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
         await session.initialize()
@@ -322,6 +352,11 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
                 return BaseGetSearchQueryResponse(search_results=f"Error: {text}")
             return BaseGetSearchQueryResponse(search_results=text)
         except Exception as e:
+            # This used to fail silently into the response body only -- the agent would see
+            # "Error: ..." as if it were a search result, but nothing in our own logs would show
+            # it. A connection failure here means we've actually lost internet access,
+            # log it more clearly.
+            logger.error(f"brave_search.search() failed: {type(e).__name__}: {e}")
             return BaseGetSearchQueryResponse(search_results=f"Error: Unexpected error - {str(e)}")
 
     async def browse(self, body: BaseGetPageContentRequest) -> BaseGetPageContentResponse:
@@ -341,6 +376,10 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
             else:
                 return BaseGetPageContentResponse(page_content="No HTML found")
         except Exception as e:
+            # [ADDED 2026-11-04] See the matching comment in search() -- trafilatura.fetch_url
+            # is a genuine internet-bound call (through the proxy when enabled), so a failure
+            # here is worth a loud log line, not just a string buried in the response body.
+            logger.error(f"brave_search.browse() failed for url={body.url!r}: {type(e).__name__}: {e}")
             return BaseGetPageContentResponse(page_content=f"Error: Unexpected error = {str(e)}")
 
     async def verify(self, body: BraveSearchVerifyRequest) -> BraveSearchVerifyResponse:

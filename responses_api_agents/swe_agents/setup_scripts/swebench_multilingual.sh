@@ -61,7 +61,17 @@ rm -rf venv
 uv venv --python 3.12 venv
 
 echo "Installing SWE-bench..."
-uv pip install -p $swebench_dir/venv/bin/python -e .
+# --no-config: without it, uv's workspace-root discovery walks up past this directory to
+# RL/pyproject.toml (Gym-workspace/Gym is a declared [tool.uv.workspace] member there) and
+# inherits its [tool.uv.extra-build-dependencies] table (transformer-engine/deep_ep/etc, all
+# "torch, match-runtime=true"). uv validates that whole table eagerly against this install's
+# own resolution regardless of whether any of those specific packages are present, and since
+# plain SWE-bench_Multilingual has no torch dependency anywhere, this can fail outright:
+# "torch was declared as an extra build dependency with match-runtime=true, but was not found
+# in the resolution" (same fix already applied in swebench.sh/swesmith.sh/r2e_gym.sh).
+# --no-config skips picking up that ancestor config entirely, correct here since this install
+# doesn't need torch.
+uv pip install --no-config -p $swebench_dir/venv/bin/python -e .
 
 if [ -d venv ] && [ -f venv/bin/python ]; then
     echo "✓ venv created at $(pwd)/venv"

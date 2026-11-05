@@ -24,14 +24,22 @@ export UV_INSTALL_DIR="$uv_dir"
 # a project setup script.
 export UV_NO_MODIFY_PATH=1
 export UV_PYTHON_INSTALL_DIR="$python_dir"
-if [ ! -f "$uv_dir/bin/uv" ]; then
+# [FIXED 2026-11-03] uv's installer places the binary directly at $UV_INSTALL_DIR/uv (no
+# nested bin/ dir) -- confirmed by the other 3 sibling scripts (swebench.sh/r2e_gym.sh/
+# swebench_multilingual.sh), which all check/PATH-prepend $uv_dir (no /bin) and resolve
+# correctly. This script's old $uv_dir/bin/uv path never exists, so the check below was
+# always true (redundant reinstall every run) and the PATH prepend below was a no-op --
+# `which uv` fell through to whatever other uv was already on PATH (e.g. an older
+# ~/.local/bin/uv), which then failed SWE-smith's own `required-version` check with a
+# confusing "does not match the running version" error pointing at the WRONG binary.
+if [ ! -f "$uv_dir/uv" ]; then
     echo "Installing uv to $uv_dir..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
 else
     echo "uv already installed at $uv_dir"
 fi
 
-export PATH="$uv_dir/bin:$PATH"
+export PATH="$uv_dir:$PATH"
 echo "Verifying uv installation..."
 which uv
 uv --version
@@ -70,7 +78,17 @@ uv venv --python 3.11 venv
 # used to install it, so `docker` (the lightweight PyPI client library, NOT a running daemon --
 # we never call any method that actually connects to one) is added explicitly alongside it.
 echo "Installing SWE-smith (validate extra + docker, editable) in isolated venv..."
-uv pip install -p $swesmith_dir/venv/bin/python -e ".[validate]" docker --no-cache
+# --no-config: without it, uv's workspace-root discovery walks up past this directory to
+# RL/pyproject.toml (Gym-workspace/Gym is a declared [tool.uv.workspace] member there) and
+# inherits its [tool.uv.extra-build-dependencies] table (transformer-engine/deep_ep/etc, all
+# "torch, match-runtime=true"). uv validates that whole table eagerly against this install's
+# own resolution regardless of whether any of those specific packages are present, and since
+# plain SWE-smith has no torch dependency anywhere, it fails outright: "torch was declared as
+# an extra build dependency with match-runtime=true, but was not found in the resolution"
+# (confirmed directly via a real presync run -- same fix already applied in swebench.sh).
+# --no-config skips picking up that ancestor config entirely, correct here since this install
+# doesn't need torch.
+uv pip install --no-config -p $swesmith_dir/venv/bin/python -e ".[validate]" docker --no-cache
 
 echo "Verifying installation..."
 $swesmith_dir/venv/bin/python -c "from swesmith.profiles import registry; from swesmith.harness.grading import get_eval_report; print('✓ swesmith installed successfully, registry has', len(registry.keys()), 'repos')"

@@ -47,8 +47,12 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import functools
+import hashlib
 import logging
 import os
+import random
+import re
 import shlex
 import signal
 import subprocess
@@ -56,6 +60,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+import ray
 
 
 logger = logging.getLogger(__name__)
@@ -81,7 +87,18 @@ _VM_IMAGE_DIR_DEFAULT = "/leonardo_scratch/fast/BOOST_EUROPA/images/vm"
 # sandbox_launcher.py's hardcoded port 6000 lets independent ns_tools/reasoning_gym processes
 # find the same sandbox. /tmp is node-local (not shared storage), matching sandbox_launcher.py's
 # own choice of /tmp for its lock/log paths.
-_STATE_DIR = "/tmp/vm_launcher"
+#
+# [CUSTOM-VM-STATE-DIR-JOB-SCOPE 2026-11-03] A bare, unscoped "/tmp/vm_launcher" meant a qemu
+# sidecar orphaned by one job was completely invisible to the NEXT job that later landed
+# on the same node: that job writes its own fresh pidfile/overlay to the SAME path, "kills" only
+# the PID it just wrote itself (a no-op against the real orphan), then collides with the
+# orphan's still-held write lock on disk.qcow2.
+# Fix: scope the state dir per Ray-cluster-bringup instead of a bare constant, so a different
+# job (or a fresh Ray cluster bring-up within the same job) can never collide with a previous
+# one's leftover state.
+def _cluster_scope_id() -> str:
+    gcs_address = ray.get_runtime_context().gcs_address
+    return hashlib.sha1(gcs_address.encode()).hexdigest()[:10]
 
 
 class VMConnectionInfo:
@@ -92,8 +109,12 @@ class VMConnectionInfo:
         self.ssh_port = ssh_port
 
 
+@functools.lru_cache(maxsize=1)
 def _work_dir() -> str:
-    d = _STATE_DIR
+    # Computed lazily (not at import time) and cached for the life of the process: Ray isn't
+    # guaranteed initialized yet when this module is first imported, only by the time ensure_vm()
+    # actually runs.
+    d = f"/tmp/vm_launcher-{_cluster_scope_id()}"
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -173,6 +194,33 @@ def _tail_log(n: int = 60) -> str:
         return f"(could not read log: {e})"
 
 
+def _overlay_disk_path() -> str:
+    """The fixed path _spawn() always builds its disk overlay at -- see _kill_stale_vm."""
+    return os.path.join(_work_dir(), "disk.qcow2")
+
+
+def _fuser_pids(path: str) -> list[int]:
+    """Host PIDs currently holding `path` open, via `fuser`.
+
+    Resolves to the real host PID even when the holder is running inside a PID-namespaced
+    container (e.g. qemu under `singularity exec --containall`) -- unlike reading a pidfile the
+    process itself wrote, which only ever reflects the PID as seen from *inside* its own
+    namespace. See _kill_stale_vm's docstring for why that distinction matters here.
+    """
+    if not os.path.exists(path):
+        return []
+    try:
+        result = subprocess.run(["fuser", path], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = []
+    for token in result.stdout.split():
+        match = re.match(r"(\d+)", token)
+        if match:
+            pids.append(int(match.group(1)))
+    return pids
+
+
 def _kill_stale_vm() -> None:
     """[CUSTOM-VM-WATCHDOG-RESTART-FIX 2026-10-28] _spawn() always builds its disk overlay at
     the same fixed path (_work_dir()/disk.qcow2) regardless of whether this is a fresh first
@@ -187,41 +235,43 @@ def _kill_stale_vm() -> None:
     dead -- but if a VM ever DOES genuinely crash instead of just stalling, there would be no
     working recovery path at all and that node would be stuck for the rest of the job.
 
-    Fix: before ever touching the overlay, make sure nothing is still holding it. Does not rely
-    on SSH (the guest not answering SSH is exactly the symptom that got us here) -- goes straight
-    to the host-visible PID from the last spawn's pidfile: SIGTERM, a short grace period, then
-    SIGKILL if it's still around. A completely fresh node (no pidfile yet, or a pidfile for a
-    PID that's already gone) is a silent no-op.
+    Fix: before ever touching the overlay, make sure nothing is still holding it.
 
+    [CUSTOM-VM-FUSER-STALE-CHECK 2026-11-04] The original implementation here read the last-known
+    QEMU PID from {work_dir}/vm.pid (written by vm_start() from QEMU's own -pidfile) and checked
+    it with os.kill(pid, 0). That never actually worked: qemu runs inside `singularity exec
+    --containall`, which gives it its own PID namespace, so -pidfile writes the PID *as seen
+    inside that namespace* -- always a low number like 13 -- never the real host PID. Checking
+    that value on the host either hits an unrelated, root-owned low-numbered kernel thread
+    (PermissionError, silently treated below as "not ours, don't touch") or a coincidentally
+    already-dead PID -- either way this was a guaranteed no-op on every call. Confirmed directly
+    on a live job: zero "Killing stale VM process" log lines were ever printed despite real
+    orphaned qemu processes holding the overlay's write lock the whole time.
+    Fix: resolve the actual holder(s) via `fuser` against the overlay disk file itself, which
+    resolves to the correct HOST pid regardless of the container's PID namespace -- confirmed
+    directly against a live, namespaced qemu process (`fuser -v disk.qcow2` found the real host
+    PID; `vm.pid` on the same node read the namespace-local "13"). A completely fresh node (no
+    overlay file yet, or one nothing currently has open) is a silent no-op.
     """
-    pid_path = _pid_path()
-    if not os.path.exists(pid_path):
+    overlay_path = _overlay_disk_path()
+    pids = _fuser_pids(overlay_path)
+    if not pids:
         return
-    try:
-        pid = int(open(pid_path).read().strip())
-    except (ValueError, OSError):
-        return
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return  # already gone -- nothing to clean up
-    except PermissionError:
-        return  # not ours (e.g. pid reused by an unrelated process) -- don't touch it
-    logger.warning("Killing stale VM process pid=%d before respawning on %s", pid, _hostname())
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    for pid in pids:
+        logger.warning("Killing stale VM process pid=%d (holding %s) before respawning on %s", pid, overlay_path, _hostname())
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
     for _ in range(50):  # 5s grace period, matching vm_stop()'s own poll cadence in lib.sh
         time.sleep(0.1)
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _fuser_pids(overlay_path):
             return
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    for pid in _fuser_pids(overlay_path):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _spawn(
@@ -391,10 +441,49 @@ def ensure_vm(
                 if info is not None and _check_health(info):
                     logger.info("VM became healthy while waiting for the spawn lock, skipping spawn")
                 else:
-                    _spawn(golden_image_dir, lustre_share_roots, block_device_mounts)
-                    info = _current_connection_info()
-                    if info is None or not _check_health(info):
-                        raise RuntimeError(f"VM did not become healthy after boot (see {_log_path()}):\n{_tail_log()}")
+                    # [CUSTOM-VM-BOOT-JITTER-RETRY 2026-11-03] Every node's first rollout tends to
+                    # land within the same few seconds of each other right after a job starts or
+                    # resumes, so every node's first (cold) VM boot was observed firing in the same
+                    # ~20s window across the whole cluster -- confirmed directly: 132-424 boot
+                    # timeouts per job, all clustered into one 18-27s span. A real boot is cheap on
+                    # an uncontended host, but dozens of simultaneous cold boots compete for the
+                    # same CPU at once. A small random stagger before the first attempt spreads that
+                    # demand out; a single retry (after the storm this node was part of has likely
+                    # already cleared) recovers the common case where the first attempt lost that
+                    # race anyway. Both are bounded: the stagger only delays this node's first-ever
+                    # boot (a one-time, per-node cost -- every later call on this node just hits the
+                    # fast health-check path above), and the retry means one cold boot can cost at
+                    # most ~2x _BOOT_TIMEOUT_S instead of failing permanently after one attempt.
+                    boot_jitter_max_s = float(os.environ.get("VM_LAUNCHER_BOOT_JITTER_MAX_S", "20"))
+                    if boot_jitter_max_s > 0:
+                        delay = random.uniform(0, boot_jitter_max_s)
+                        logger.info(
+                            "Staggering VM boot on %s by %.1fs to avoid a cluster-wide cold-start storm",
+                            _hostname(),
+                            delay,
+                        )
+                        time.sleep(delay)
+
+                    last_error: Optional[RuntimeError] = None
+                    for attempt in range(2):
+                        if attempt > 0:
+                            logger.warning(
+                                "VM boot attempt %d failed on %s, retrying once: %s", attempt, _hostname(), last_error
+                            )
+                            time.sleep(5)
+                        try:
+                            _spawn(golden_image_dir, lustre_share_roots, block_device_mounts)
+                            info = _current_connection_info()
+                            if info is not None and _check_health(info):
+                                last_error = None
+                                break
+                            last_error = RuntimeError(
+                                f"VM did not become healthy after boot (see {_log_path()}):\n{_tail_log()}"
+                            )
+                        except RuntimeError as e:
+                            last_error = e
+                    if last_error is not None:
+                        raise last_error
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
