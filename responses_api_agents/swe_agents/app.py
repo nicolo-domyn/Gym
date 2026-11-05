@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import sys
+import threading
 import time
 import uuid
 from asyncio import Semaphore
@@ -370,12 +371,34 @@ class BaseDatasetHarnessProcessor(BaseModel):
         return_code = process.wait()
         assert return_code == 0, f"Command failed: {command}"
 
+    @staticmethod
+    def _heartbeat_loop(heartbeat_path: Path, stop_event: threading.Event, interval: float) -> None:
+        while not stop_event.wait(interval):
+            try:
+                heartbeat_path.touch()
+            except OSError:
+                pass
+
     @contextmanager
     def _setup_directory_lock(self, setup_dir: Path, label: str):
-        """Cross-node lock using mkdir (atomic on Lustre/NFS, unlike fcntl.flock)."""
+        """Cross-node lock using mkdir (atomic on Lustre/NFS, unlike fcntl.flock).
+
+        [CUSTOM-SETUP-LOCK-HEARTBEAT 2026-11-03] Staleness used to be judged purely by the lock
+        dir's own mtime -- but nothing ever touches that after the initial mkdir, so it could only
+        ever measure "time since acquisition," never "is the holder still alive".
+        Fix: the holder now actively proves it's alive via a periodically-touched heartbeat file
+        inside the lock dir. A waiter judges the heartbeat's own freshness (dead in ~3 missed beats)
+        instead of the lock dir's age, so a genuinely slow build -- however long it takes -- is never
+        killed early, while a dead holder is caught in ~90s instead of up to an hour. `max_wait`
+        stays as a hard backstop for the separate (rare, inherent to any heartbeat scheme) case of a
+        holder that's alive but truly hung rather than dead.
+        """
         lock_dir = setup_dir.parent
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_path = lock_dir / f".{setup_dir.name}.lockdir"
+        heartbeat_path = lock_path / "heartbeat"
+        heartbeat_interval = 30
+        heartbeat_stale_after = 3 * heartbeat_interval
 
         print(f"Acquiring {label} setup lock at {lock_path}", flush=True)
         max_wait = 3600
@@ -386,26 +409,49 @@ class BaseDatasetHarnessProcessor(BaseModel):
                 lock_path.mkdir(exist_ok=False)
                 break
             except FileExistsError:
-                stale_threshold = 3600
                 try:
-                    lock_age = time.time() - lock_path.stat().st_mtime
-                    if lock_age > stale_threshold:
-                        print(f"  Lock appears stale ({lock_age:.0f}s old), breaking it", flush=True)
-                        shutil.rmtree(lock_path, ignore_errors=True)
-                        continue
+                    heartbeat_age = time.time() - heartbeat_path.stat().st_mtime
+                    stale = heartbeat_age > heartbeat_stale_after
+                    age_desc = f"last heartbeat {heartbeat_age:.0f}s ago"
                 except OSError:
-                    pass
+                    # No heartbeat file yet -- either a brand-new holder (race right after its own
+                    # mkdir, before its first touch) or a holder running older code that predates
+                    # this mechanism entirely. Fall back to the lock dir's own age against the full
+                    # max_wait, i.e. exactly today's pre-heartbeat behavior.
+                    try:
+                        lock_age = time.time() - lock_path.stat().st_mtime
+                        stale = lock_age > max_wait
+                        age_desc = f"no heartbeat yet, lock dir {lock_age:.0f}s old"
+                    except OSError:
+                        stale = False
+                        age_desc = "no heartbeat yet"
+                if stale:
+                    print(f"  Lock appears stale ({age_desc}), breaking it", flush=True)
+                    shutil.rmtree(lock_path, ignore_errors=True)
+                    continue
                 if waited >= max_wait:
                     raise TimeoutError(f"Timed out waiting for {label} setup lock after {max_wait}s")
                 if waited % 30 == 0:
                     print(
-                        f"  Waiting for {label} setup lock (held by another process, {waited}s elapsed)...", flush=True
+                        f"  Waiting for {label} setup lock (held by another process, {age_desc}, "
+                        f"{waited}s elapsed)...",
+                        flush=True,
                     )
                 time.sleep(poll_interval)
                 waited += poll_interval
+        heartbeat_path.touch()
+        stop_heartbeat = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(heartbeat_path, stop_heartbeat, heartbeat_interval),
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             yield
         finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=heartbeat_interval)
             shutil.rmtree(lock_path, ignore_errors=True)
 
     # Setup method is sync for now since there's been no need to concurrently set up
