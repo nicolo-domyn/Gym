@@ -16,7 +16,7 @@ import asyncio
 import json
 import multiprocessing as mp
 from copy import deepcopy
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 from math_verify.errors import TimeoutException
@@ -35,6 +35,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.server_utils import ServerClient
 from resources_servers.math_with_judge.app import (
+    AnswerFormatRule,
     JudgeEvaluation,
     LibraryJudgeMathResourcesServer,
     LibraryJudgeMathResourcesServerConfig,
@@ -197,6 +198,9 @@ class TestApp:
         assert not_equal_verify_response.expected_answer == expected_answer
         assert not_equal_verify_response.extracted_answer == "1"
         assert not_equal_verify_response.library_reward == approx(0.0)
+        # No system prompt, so no format is required.
+        assert not_equal_verify_response.format_ok is None
+        assert not_equal_verify_response.required_answer_format is None
         judge_evaluations = not_equal_verify_response.judge_evaluations
         assert len(judge_evaluations) == 1
         self._check_judge_evaluation(
@@ -211,8 +215,10 @@ class TestApp:
         assert sorted(list(not_equal_verify_response.model_dump())) == [
             "expected_answer",
             "extracted_answer",
+            "format_ok",
             "judge_evaluations",
             "library_reward",
+            "required_answer_format",
             "response",
             "responses_create_params",
             "reward",
@@ -246,15 +252,261 @@ class TestApp:
         assert equal_verify_response.extracted_answer == "x + 1"
         assert equal_verify_response.library_reward == approx(1.0)
         assert equal_verify_response.judge_evaluations is None
+        assert equal_verify_response.format_ok is None
+        assert equal_verify_response.required_answer_format is None
         assert sorted(list(equal_verify_response.model_dump())) == [
             "expected_answer",
             "extracted_answer",
+            "format_ok",
             "judge_evaluations",
             "library_reward",
+            "required_answer_format",
             "response",
             "responses_create_params",
             "reward",
         ]
+
+    BOXED_SYSTEM_PROMPT = "Write your final answer within \\boxed{}."
+    ANSWER_LINE_SYSTEM_PROMPT = (
+        'Remember to put your answer on its own line at the end in the form "ANSWER: $ANSWER" (without quotes) '
+        "where $ANSWER is the answer to the problem, and you do not need to use a \\boxed command."
+    )
+
+    async def _verify_text(
+        self,
+        server: LibraryJudgeMathResourcesServer,
+        text: str,
+        expected_answer: str,
+        system_prompt: Optional[str] = None,
+    ):
+        question = "What is the answer?"
+        messages = [{"role": "user", "content": question}]
+        if system_prompt is not None:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        output_item = self._create_response_output_message(text)
+        return await server.verify(
+            LibraryJudgeMathVerifyRequest(
+                responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=messages),
+                response=NeMoGymResponse(**self._create_response("format_id", output_item)),
+                question=question,
+                expected_answer=expected_answer,
+            )
+        )
+
+    def test_has_answer_format(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+        resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+        # (response text, has a closed \boxed{}, has an ANSWER: line)
+        cases = [
+            ("So the result is \\boxed{5}.", True, False),
+            ("$\\boxed{\\frac{1}{2}}$", True, False),
+            ("\\fbox{5}", True, False),
+            ("\\boxed {x^{2}}", True, False),
+            ("Unclosed \\boxed{5 then \\boxed{7}", True, False),
+            ("\\boxed{\\frac{1}{2}", False, False),
+            ("Work.\n\nANSWER: 5", False, True),
+            ("answer: 5", False, True),
+            ("**Answer:** 5", False, True),
+            ("Final answer: 5", False, True),
+            ("> ANSWER: $5$", False, True),
+            ("\\boxed{3}\n\nANSWER: 5", True, True),
+            ("", False, False),
+            ("We get 2 + 3 = 5", False, False),
+            ("The answer is 5.", False, False),
+            ("The final answer is $5$.", False, False),
+            ("Let me check my answer: 2 + 2 = 4", False, False),
+        ]
+        for text, has_boxed, has_answer_line in cases:
+            assert resources_server._has_answer_format(text, "boxed") is has_boxed, text
+            assert resources_server._has_answer_format(text, "answer_line") is has_answer_line, text
+
+    def test_required_answer_format(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+        resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+        user_message = {"role": "user", "content": "What is 2 + 3?"}
+
+        def required_answer_format(input: Any, instructions: Optional[str] = None) -> Optional[str]:
+            params = NeMoGymResponseCreateParamsNonStreaming(input=input, instructions=instructions)
+            return resources_server._required_answer_format(params)
+
+        boxed_system = {"role": "system", "content": self.BOXED_SYSTEM_PROMPT}
+        assert required_answer_format([boxed_system, user_message]) == "boxed"
+        # The ANSWER: rule comes first: this prompt also mentions \boxed.
+        answer_line_system = {"role": "system", "content": self.ANSWER_LINE_SYSTEM_PROMPT}
+        assert required_answer_format([answer_line_system, user_message]) == "answer_line"
+        assert required_answer_format([{"role": "developer", "content": self.BOXED_SYSTEM_PROMPT}]) == "boxed"
+        content_list_system = {
+            "role": "system",
+            "content": [{"type": "input_text", "text": self.BOXED_SYSTEM_PROMPT}],
+        }
+        assert required_answer_format([content_list_system, user_message]) == "boxed"
+        # `instructions` is not sent to the model by vllm_model, so it does not count.
+        assert required_answer_format([user_message], instructions=self.ANSWER_LINE_SYSTEM_PROMPT) is None
+        # Only the system prompt counts, not a format asked for in the user message.
+        assert (
+            required_answer_format([{"role": "user", "content": "What is 2 + 3? " + self.BOXED_SYSTEM_PROMPT}]) is None
+        )
+        # A prompt with neither text has no format check.
+        assert required_answer_format([{"role": "system", "content": "You are a helpful assistant."}]) is None
+        assert required_answer_format([{"role": "system", "content": "End with a line ANSWER: <value>."}]) is None
+        assert required_answer_format("What is 2 + 3?") is None
+
+        custom_rules_config = config.model_copy(
+            update={"answer_format_rules": [AnswerFormatRule(prompt_text="\\boxed{}", answer_format="boxed")]}
+        )
+        custom_rules_server = LibraryJudgeMathResourcesServer(
+            config=custom_rules_config, server_client=MagicMock(spec=ServerClient)
+        )
+        params = NeMoGymResponseCreateParamsNonStreaming(input=[answer_line_system, user_message])
+        assert custom_rules_server._required_answer_format(params) is None
+        params = NeMoGymResponseCreateParamsNonStreaming(input=[boxed_system, user_message])
+        assert custom_rules_server._required_answer_format(params) == "boxed"
+
+        with raises(ValidationError):
+            LibraryJudgeMathResourcesServerConfig(**(config.model_dump() | {"format_penalty": 1.5}))
+        with raises(ValidationError):
+            AnswerFormatRule(prompt_text="ANSWER: $ANSWER", answer_format="latex")
+
+    def test_answer_line_extraction(self) -> None:
+        # (response text, last ANSWER: line content, normalized content)
+        cases = [
+            ("ANSWER: \\sqrt{2}", "\\sqrt{2}", "\\sqrt{2}"),
+            ("**Answer:** $x^2 + 1$", "$x^2 + 1$", "x^2 + 1"),
+            ("**Final Answer:**\nThere are **81** days.", "There are **81** days.", "There are **81** days"),
+            ("ANSWER: \\(5\\).", "\\(5\\).", "5"),
+            ("ANSWER: $$\\frac{1}{2}$$", "$$\\frac{1}{2}$$", "\\frac{1}{2}"),
+            ("ANSWER: **5**", "5**", "5"),
+            ("ANSWER: 0.5", "0.5", "0.5"),
+            ("ANSWER: \\frac{1}{2}\\,", "\\frac{1}{2}\\,", "\\frac{1}{2}\\,"),
+            ("ANSWER: $3$ and $5$", "$3$ and $5$", "$3$ and $5$"),
+            ("ANSWER: D<|im_end|>", "D<|im_end|>", "D"),
+            ("ANSWER: 5 <|endoftext|><|im_end|>", "5 <|endoftext|><|im_end|>", "5"),
+            # Only token-like names at the end of the line are special tokens, not math.
+            ("ANSWER: 0<|x|>1", "0<|x|>1", "0<|x|>1"),
+            ("ANSWER: E = <|x|>", "E = <|x|>", "E = <|x|>"),
+            ("ANSWER: <|x - 1|>", "<|x - 1|>", "<|x - 1|>"),
+            ("ANSWER: <|im_start|>5", "<|im_start|>5", "<|im_start|>5"),
+            ("ANSWER:\n\n2\\sqrt{2}\nDone.", "2\\sqrt{2}", "2\\sqrt{2}"),
+            ("ANSWER: 1\nWait, no.\nANSWER: 2", "2", "2"),
+            ("ANSWER:", "", ""),
+            # Display math opened on (or after) the ANSWER: line is read up to its closing delimiter.
+            ("ANSWER:\n\\[\n1280\n\\]\nDone.", "\\[ 1280 \\]", "1280"),
+            ("ANSWER: $$\n\\frac{1}{2}\n$$", "$$ \\frac{1}{2} $$", "\\frac{1}{2}"),
+            # Unicode math and \big-style size modifiers are rewritten as LaTeX.
+            ("ANSWER: 2√5/5**", "2√5/5**", "2\\sqrt{5}/5"),
+            ("ANSWER: $√14$", "$√14$", "\\sqrt{14}"),
+            ("ANSWER: √(x+1)", "√(x+1)", "\\sqrt{x+1}"),
+            ("ANSWER: −3π/4", "−3π/4", "-3\\pi /4"),
+            (
+                "ANSWER: \\big\\lfloor \\frac{2n}{3} \\big\\rfloor",
+                "\\big\\lfloor \\frac{2n}{3} \\big\\rfloor",
+                "\\lfloor \\frac{2n}{3} \\rfloor",
+            ),
+            ("ANSWER: \\bigcup_i A_i", "\\bigcup_i A_i", "\\bigcup_i A_i"),
+            # A second "ANSWER:", also inside math delimiters, backticks or \text{...}.
+            ("**Final answer:**\n\\(ANSWER: \\frac18\\)", "\\(ANSWER: \\frac18\\)", "\\frac18"),
+            ("Answer:\n`ANSWER: 1,2,3,4`", "`ANSWER: 1,2,3,4`", "1,2,3,4"),
+            ("ANSWER: \\(\\displaystyle\\text{ANSWER: 168}\\)", "\\(\\displaystyle\\text{ANSWER: 168}\\)", "168"),
+            ("ANSWER: \\text{No}", "\\text{No}", "\\text{No}"),
+            # A math delimiter whose pair is missing, but not an escaped dollar.
+            ("ANSWER: 1+3\\sqrt{2}\\)", "1+3\\sqrt{2}\\)", "1+3\\sqrt{2}"),
+            ("ANSWER: \\$4.34", "\\$4.34", "\\$4.34"),
+        ]
+        for text, content, normalized in cases:
+            assert LibraryJudgeMathResourcesServer._extract_answer_line(text) == content, text
+            assert LibraryJudgeMathResourcesServer._normalize_answer_line(content) == normalized, text
+
+    async def test_verify_format_penalty(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+        no_judge_config = config.model_copy(update={"should_use_judge": False})
+        server = LibraryJudgeMathResourcesServer(config=no_judge_config, server_client=MagicMock(spec=ServerClient))
+        # Off by default: format_ok is reported but the reward is unchanged.
+        default_response = await self._verify_text(server, "We get 2 + 3 = 5", "5", self.BOXED_SYSTEM_PROMPT)
+        assert default_response.required_answer_format == "boxed"
+        assert default_response.format_ok is False
+        assert default_response.reward == approx(1.0)
+
+        penalized_config = no_judge_config.model_copy(update={"penalize_answer_format": True})
+        server = LibraryJudgeMathResourcesServer(config=penalized_config, server_client=MagicMock(spec=ServerClient))
+        boxed, answer_line = self.BOXED_SYSTEM_PROMPT, self.ANSWER_LINE_SYSTEM_PROMPT
+        # (system prompt, response text, format_ok, reward, library_reward)
+        cases = [
+            (boxed, "So 2 + 3 = \\boxed{5}.", True, 1.0, 1.0),
+            # The format the system prompt did not ask for does not count.
+            (boxed, "ANSWER: 5", False, 0.5, 1.0),
+            (boxed, "We get 2 + 3 = 5", False, 0.5, 1.0),
+            (boxed, "\\boxed{6}", True, 0.0, 0.0),
+            (boxed, "We get 2 + 3 = 6", False, 0.0, 0.0),
+            (answer_line, "ANSWER: 5", True, 1.0, 1.0),
+            (answer_line, "So 2 + 3 = \\boxed{5}.", False, 0.5, 1.0),
+            # No format asked for: no penalty.
+            (None, "We get 2 + 3 = 5", None, 1.0, 1.0),
+        ]
+        for system_prompt, text, format_ok, reward, library_reward in cases:
+            response = await self._verify_text(server, text, "5", system_prompt)
+            assert response.format_ok is format_ok, (system_prompt, text)
+            assert response.reward == approx(reward), (system_prompt, text)
+            assert response.library_reward == approx(library_reward), (system_prompt, text)
+
+        full_penalty_config = penalized_config.model_copy(update={"format_penalty": 1.0})
+        server = LibraryJudgeMathResourcesServer(
+            config=full_penalty_config, server_client=MagicMock(spec=ServerClient)
+        )
+        assert (await self._verify_text(server, "We get 2 + 3 = 5", "5", boxed)).reward == approx(0.0)
+
+    async def test_verify_grade_answer_line(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+        no_judge_config = config.model_copy(update={"should_use_judge": False})
+        whole_text_server = LibraryJudgeMathResourcesServer(
+            config=no_judge_config, server_client=MagicMock(spec=ServerClient)
+        )
+        answer_line_config = no_judge_config.model_copy(update={"grade_answer_line": True})
+        answer_line_server = LibraryJudgeMathResourcesServer(
+            config=answer_line_config, server_client=MagicMock(spec=ServerClient)
+        )
+        # (response text, expected answer, reward grading the whole text, reward grading the ANSWER: line)
+        cases = [
+            # LaTeX without $...$ after "ANSWER:" is only read inside \boxed{}.
+            ("ANSWER: \\sqrt{2}", "\\sqrt{2}", 0.0, 1.0),
+            ("ANSWER: 2\\sqrt{2}", "2\\sqrt{2}", 0.0, 1.0),
+            ("ANSWER: x^2 + 1", "x^2+1", 0.0, 1.0),
+            ("ANSWER: (2, 3)", "(2,3)", 0.0, 1.0),
+            ("ANSWER: D", "D", 0.0, 1.0),
+            ("**ANSWER:** $\\frac{1}{2}$.", "\\frac{1}{2}", 1.0, 1.0),
+            # Falls back to the line as written when \boxed{} cannot read it.
+            ("ANSWER: there are **81** days", "81", 1.0, 1.0),
+            ("**Final Answer:**\nThere are **81** days.", "81", 1.0, 1.0),
+            # Only the ANSWER: line is graded, not a number or a \boxed{} elsewhere in the response.
+            ("We first find $x = 5$.\n\nANSWER: \\sqrt{3}", "5", 1.0, 0.0),
+            ("\\boxed{3}\n\nANSWER: 5", "5", 0.0, 1.0),
+            ("ANSWER: 3 or 5", "5", 0.0, 0.0),
+            # Answer lines that math-verify cannot read as written (seen in training rollouts).
+            ("We find $AB = 16\\sqrt{3}$.\n\nANSWER: 16√3", "16\\sqrt{3}", 0.0, 1.0),
+            ("**Final answer:**\n\\(ANSWER: \\frac18\\)", "\\frac{1}{8}", 0.0, 1.0),
+            (
+                "ANSWER: \\(\\big\\lfloor \\frac{2n}{3} \\big\\rfloor + 1\\)",
+                "\\left\\lfloor \\frac{2n}{3} \\right\\rfloor + 1",
+                0.0,
+                1.0,
+            ),
+            ("ANSWER: 1+3\\sqrt{2}\\)", "1+3\\sqrt{2}", 0.0, 1.0),
+            ("ANSWER:\n\\[\n1280\n\\]", "1280", 1.0, 1.0),
+            # Without an ANSWER: line the whole text is graded.
+            ("So 2 + 3 = \\boxed{5}.", "5", 1.0, 1.0),
+        ]
+        for text, expected_answer, whole_text_reward, answer_line_reward in cases:
+            whole_text_response = await self._verify_text(
+                whole_text_server, text, expected_answer, self.ANSWER_LINE_SYSTEM_PROMPT
+            )
+            assert whole_text_response.reward == approx(whole_text_reward), text
+            answer_line_response = await self._verify_text(
+                answer_line_server, text, expected_answer, self.ANSWER_LINE_SYSTEM_PROMPT
+            )
+            assert answer_line_response.reward == approx(answer_line_reward), text
+
+        # Only when the system prompt asks for an ANSWER: line.
+        response = await self._verify_text(
+            answer_line_server, "ANSWER: \\sqrt{2}", "\\sqrt{2}", self.BOXED_SYSTEM_PROMPT
+        )
+        assert response.reward == approx(0.0)
+        response = await self._verify_text(answer_line_server, "ANSWER: \\sqrt{2}", "\\sqrt{2}")
+        assert response.reward == approx(0.0)
 
     async def test_verify_answer(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
         server_mock = MagicMock(spec=ServerClient)

@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import json
+import math
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -57,14 +59,107 @@ class MultiVerseMathHardResponse(BaseModel):
 
 
 class MultiVerseMathHardVerifyRequest(BaseVerifyRequest):
-    ground_truth: list[float] | str
     id: int
     depth: int
     breadth: int
+    # [CUSTOM-FRESH-GROUND-TRUTH 2026-11-06] REQUIRED: replaces the old pre-rounded
+    # `ground_truth` (list[float] | str, derived from the upstream dataset's own
+    # `simplified_values`) entirely -- see the comment block above _ALLOWED_FUNCTIONS below
+    # for the full rationale. There is exactly one grading path now; data that doesn't carry
+    # this field will fail request validation rather than silently falling back to the old,
+    # known-incorrect-for-depth>=2 comparison.
+    ground_truth_expression: str
 
 
 class MultiVerseMathHardVerifyResponse(BaseVerifyResponse):
     pass
+
+
+# [CUSTOM-FRESH-GROUND-TRUTH 2026-11-06] The upstream HF dataset
+# (nvidia/Nemotron-RL-math-advanced_calculations) stores pre-computed ground truth
+# (`simplified_values`) as round(true_value, N) per value (N varies 0-5 decimals), AND for
+# multi-step rows the rounding COMPOUNDS: later steps' literal arguments reuse the
+# PREVIOUSLY-ROUNDED result of an earlier step, not its true value (confirmed directly on
+# real data: the dataset's own trace for sin(log(7.0,4.0)) literally computes
+# sin(radians=1.14), using the rounded 1.14, not the true 1.1414649225389244). A prior fix
+# attempted rounding the *predicted* value to each ground-truth value's own implied
+# precision before comparing -- this fully fixed depth-1 (single-step) problems, but could
+# not fix depth>=2: the dataset's own rounded-chain value can diverge from a model's
+# genuinely-correct, full-precision tool-call chain by far more than one rounding digit, and
+# this divergence compounds with depth. Confirmed empirically on 500-row/depth samples: no
+# global or per-depth tolerance can separate "correct but diverged from the rounded-chain
+# ground truth" from "actually wrong" starting at depth 2 -- the error distributions
+# overlap (e.g. depth 2's 90th-percentile correct-but-diverged error already exceeds the
+# 10th-percentile genuinely-wrong-answer error).
+#
+# The only real fix: stop trusting the upstream rounded/compounded ground truth entirely
+# and recompute it fresh, in true float64 precision, from the raw nested expression (e.g.
+# "sin(radians=log(a=7.0, base=4.0))", optionally ";"-separated for multi-answer rows) --
+# this is the SAME expression format as the upstream HF dataset's own `ground_truth` column
+# (not `simplified_values`/`simplifications`, which are exactly the corrupted columns
+# above). Ground-truth expressions only ever call this fixed, known set of 11 functions
+# with numeric-literal keyword arguments, so this is evaluated via a restricted AST walker
+# (not raw eval()) that rejects anything outside that shape -- cheap to do properly, and
+# this is externally-sourced data, not trusted Python.
+#
+# Comparison uses a tight float tolerance (not exact ==) because this is still floating-
+# point arithmetic: the model's own tool-call sequence and this fresh recomputation can
+# differ by last-ULP noise depending on operation order. rel_tol=abs_tol=1e-9 is many
+# orders of magnitude tighter than any real wrong answer ever gets to the correct value
+# (empirically, the CLOSEST synthetic wrong-answer variant found across thousands of
+# sampled rows this session never landed closer than ~1.6% relative error) while
+# comfortably absorbing float64 noise (~1e-15 per op, negligible even compounded over the
+# deepest observed 12-call chain).
+_ALLOWED_FUNCTIONS = frozenset(
+    {"multiply", "divide", "add", "subtract", "power", "log", "sin", "cos", "pi", "negate", "return_constant"}
+)
+_GROUND_TRUTH_RTOL = 1e-9
+_GROUND_TRUTH_ATOL = 1e-9
+
+
+class GroundTruthExpressionError(ValueError):
+    """Raised when a ground_truth_expression contains anything outside the restricted shape."""
+
+
+def _safe_eval_expression(expr: str, function_map: dict) -> float:
+    """Evaluate a single ground-truth expression via a restricted AST walker.
+
+    Only permits: calls to names in _ALLOWED_FUNCTIONS, numeric (int/float) constant
+    arguments, and keyword arguments -- matching the exact shape of every real
+    ground_truth expression observed in the upstream dataset. Anything else (arbitrary
+    names, operators, attribute access, non-numeric literals, positional args) raises
+    GroundTruthExpressionError rather than being evaluated.
+    """
+    try:
+        tree = ast.parse(expr.strip(), mode="eval")
+    except SyntaxError as e:
+        raise GroundTruthExpressionError(f"Could not parse expression {expr!r}: {e}") from e
+
+    def _eval_node(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_FUNCTIONS:
+                raise GroundTruthExpressionError(f"Disallowed function call in {expr!r}: {ast.dump(node)}")
+            if node.args:
+                raise GroundTruthExpressionError(f"Positional args not allowed in {expr!r}: {ast.dump(node)}")
+            kwargs = {}
+            for kw in node.keywords:
+                if kw.arg is None:
+                    raise GroundTruthExpressionError(f"**kwargs not allowed in {expr!r}")
+                kwargs[kw.arg] = _eval_node(kw.value)
+            func = function_map[node.func.id]
+            return float(func(**kwargs))
+        raise GroundTruthExpressionError(f"Disallowed node in {expr!r}: {ast.dump(node)}")
+
+    return _eval_node(tree)
+
+
+def _eval_ground_truth_expressions(expression: str, function_map: dict) -> list[float]:
+    """Split a (possibly ";"-joined) ground_truth_expression and evaluate each sub-expression."""
+    return [_safe_eval_expression(sub, function_map) for sub in expression.split(";") if sub.strip()]
 
 
 class MultiVerseMathHardResourcesServer(SimpleResourcesServer):
@@ -101,11 +196,20 @@ class MultiVerseMathHardResourcesServer(SimpleResourcesServer):
         try:
             result = func(**args)
             return MultiVerseMathHardResponse(solution=result)
+        except (TypeError, ValueError, ArithmeticError) as e:
+            # [CUSTOM-MATHCALC-ERRORHANDLING 2026-10-24] These are client-input errors, not
+            # server bugs, for example: 
+            # - TypeError when the model omits a required arg (e.g. calling /log with 
+            #   only "a", no "base")
+            # - ValueError/ArithmeticError (covers ZeroDivisionError, logs of negative 
+            #   numbers, etc.)
+            # Previously these all fell through the bare `except Exception` below and
+            # came back as 500s, which is indistinguishable from an actual server fault.
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     async def verify(self, body: MultiVerseMathHardVerifyRequest) -> MultiVerseMathHardVerifyResponse:
-        ground_truth = json.loads(body.ground_truth)
         response = body.response.output
 
         predicted_tool_call_output = []
@@ -117,9 +221,20 @@ class MultiVerseMathHardResourcesServer(SimpleResourcesServer):
                 except Exception:
                     predicted_tool_call_output.append(None)
 
+        # [CUSTOM-FRESH-GROUND-TRUTH 2026-11-06] Recompute true ground truth fresh from the
+        # raw expression -- see the comment above _ALLOWED_FUNCTIONS for the full rationale.
+        # A malformed/unparseable expression is a genuine data bug (not a client-input
+        # error like route_to_python_function's HTTPException(400) cases above), so this
+        # raises rather than silently scoring reward=0 -- surfacing it loudly is more useful
+        # than a confusing, misattributed failing reward.
+        ground_truth_values = _eval_ground_truth_expressions(body.ground_truth_expression, self._function_map)
+
         reward = 1.0
-        for gt in ground_truth:
-            if gt not in predicted_tool_call_output:
+        for gt in ground_truth_values:
+            if not any(
+                p is not None and math.isclose(p, gt, rel_tol=_GROUND_TRUTH_RTOL, abs_tol=_GROUND_TRUTH_ATOL)
+                for p in predicted_tool_call_output
+            ):
                 reward = 0.0
                 break
 

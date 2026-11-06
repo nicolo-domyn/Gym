@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import hashlib
 import json
 import os
 from copy import deepcopy
@@ -576,8 +577,15 @@ class VLLMModel(SimpleResponsesAPIModel):
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
         session_id = request.session[SESSION_ID_KEY]
         if session_id not in self._session_id_to_client:
-            # There is probably a better way to select the endpoint for this request. But this will do for now.
-            client_idx = len(self._session_id_to_client) % len(self._clients)
+            # [CUSTOM-SESSION-CLIENT-HASH-FIX 2026-11-02] Uvicorn workers do not share this
+            # cache. A stable, hash-based assignment keeps every turn in a session on the same
+            # vLLM endpoint across workers -- the old `len(dict) % N` scheme could assign the
+            # same session to a different endpoint per call depending on which worker handled
+            # it, defeating prefix-cache affinity. Ported from upstream NVIDIA-NeMo/Gym commit
+            # fd5e84d6b (PR #2872) -- confirmed not yet merged into our v0.7.0-era base
+            # (d67ad6611) via `git merge-base --is-ancestor`.
+            digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+            client_idx = int.from_bytes(digest[:8], byteorder="big") % len(self._clients)
             client = self._clients[client_idx]
             self._session_id_to_client[session_id] = client
         client = self._session_id_to_client[session_id]

@@ -4,4 +4,19 @@
 # Specifying them here will have no effect! Use Nemo-Skills options instead.
 api_key = "EMPTY"  # pragma: allowlist secret
 custom_llm_provider = "openai"
-native_tool_calling = true
+# native_tool_calling=true made litellm/OpenHands reconstruct a prior assistant turn's text
+# from parsed structured tool-call/thinking fields rather than replaying the raw stored
+# completion byte-for-byte, breaking the token-level prefix-continuity invariant RL training
+# needs (the symptom is a "AssertionError: Found possibly non-monotonically increasing trajectory!"). 
+# Text-based (non-native) tool-call parsing replays history losslessly instead.
+native_tool_calling = false
+
+[agent]
+# OpenHands' own default (enable_history_truncation = true) lets it silently drop/condense
+# older turns once the conversation gets long. NeMo-RL's own vLLM async worker
+# (RL/nemo_rl/models/generation/vllm/vllm_worker_async.py) requires every turn's chat-templated
+# prompt to be a strict prefix extension of the previous turn's -- needed for correct
+# token-level logprob/credit assignment during RL training. History truncation breaks that
+# assumption. Also here, one observes the crash: "AssertionError: Found possibly non-monotonically
+# increasing trajectory!" inside vllm_worker_async.py's render path. Disabled here.
+enable_history_truncation = false

@@ -1,0 +1,11 @@
+-e nemo-gym[dev] @ ../../
+trafilatura==2.0.0
+# [FIXED 2026-11-03] Used to pin mcp==1.12.3 directly, which became unsatisfiable once
+# upstream's own pyproject.toml added a direct "mcp>=1.27,<2" requirement (absent entirely in
+# our old 0.6.0 base) -- nemo-gym[dev] above already pulls in a compatible mcp version
+# transitively, so pinning it again here just risks the two constraints drifting apart again.
+# Collapsing to a single, unambiguous source of truth (nemo-gym's own bound) instead.
+# Optional distributed rate limiter -- backs rate_limiter_enabled: true. The RateLimiter class
+# itself is loaded directly from nemo_rl/utils/rate_limiter.py (see app.py's
+# _load_rate_limiter_class), not vendored here; this just provides its runtime dependency.
+redis==5.2.1

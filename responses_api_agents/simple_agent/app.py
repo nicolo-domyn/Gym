@@ -145,12 +145,31 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     new_outputs.append(tool_response)
                     continue
 
-                api_response = await self.server_client.post(
-                    server_name=self.config.resources_server.name,
-                    url_path=f"/{output_function_call.name}",
-                    json=parsed_arguments,
-                    cookies=resources_server_cookies,
-                )
+                try:
+                    api_response = await self.server_client.post(
+                        server_name=self.config.resources_server.name,
+                        url_path=f"/{output_function_call.name}",
+                        json=parsed_arguments,
+                        cookies=resources_server_cookies,
+                    )
+                except TypeError as e:
+                    # orjson.dumps() (nemo_gym.server_utils.request's JSON encoder, used for
+                    # speed over stdlib json) rejects Python ints outside the i64/u64 range with
+                    # a bare TypeError, not a JSON-specific exception. A model-emitted tool-call
+                    # argument that's a bare huge integer literal (e.g. a calculator tool called
+                    # with an astronomically large operand) parses fine via json.loads above
+                    # (Python ints are arbitrary-precision) but crashes here, before the request
+                    # is even sent -- before the resources server's own Pydantic float coercion
+                    # ever gets a chance to run. Same graceful-degradation pattern as the
+                    # malformed-JSON-arguments case above: surface it as a tool response so the
+                    # rollout continues instead of crashing the whole request.
+                    tool_response = NeMoGymFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=output_function_call.call_id,
+                        output=json.dumps({"error": f"Invalid tool call arguments: {e!r}"}),
+                    )
+                    new_outputs.append(tool_response)
+                    continue
                 # We don't raise for status here since it's a valid return for the API to error e.g. if the model outputs an invalid call or something.
                 resources_server_cookies = api_response.cookies
 
