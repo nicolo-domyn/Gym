@@ -1,0 +1,30 @@
+# [CUSTOM-WIKIDATA-JUDGE 2026-11-06] A dedicated instance of equivalence_llm_judge's own
+# app.py (same pattern as lc_judge.yaml/nl2bash-equivalency.yaml), just pointed at a
+# non-STEM prompt template -- the default prompt_templates/equivalence_llm_judge.txt is
+# framed for scientific/formula-equivalence grading (its own few-shot examples are physics
+# problems), which doesn't match wikidata-triplet-qa's plain factual QA (place names,
+# titles, dates). brave_search.yaml's verifiers.equivalence_llm_judge entry points at this
+# instance's name, not the default one.
+wikidata_judge:
+  resources_servers:
+    equivalence_llm_judge:
+      entrypoint: app.py
+      judge_model_server:
+        type: responses_api_models
+        name: policy_model
+      judge_responses_create_params:
+        input: []
+      judge_prompt_template_fpath: prompt_templates/wikidata_judge.txt
+      judge_endpoint_max_concurrency: 64
+      judge_system_message: null
+      judge_equal_label: "[[A=B]]"
+      judge_not_equal_label: "[[A!=B]]"
+      question_extract_regex: null
+      response_extract_regex: null
+      msg_extraction_failure: "[NO VALID ANSWER EXTRACTED]"
+      check_twice_swap: false
+      reward_if_swap_fails: 0.0
+      domain: knowledge
+      verified: false
+      description: Wikidata factual QA judged via a non-STEM equivalence prompt
+      value: Improve knowledge-related benchmarks like wikidata-triplet-qa

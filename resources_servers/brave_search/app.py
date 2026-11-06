@@ -22,14 +22,14 @@ import subprocess
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import trafilatura
 from fastapi import FastAPI
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -38,6 +38,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.config_types import ResourcesServerRef
 from rate_limiter import RateLimiter
 
 
@@ -88,6 +89,18 @@ class BraveSearchResourcesServerConfig(BaseResourcesServerConfig):
     rate_limit_max_wait_sec: int = 10
     rate_limit_raise_after: int = 60
 
+    # [CUSTOM-VERIFIER-DISPATCH 2026-11-06] Per-row verifier selection, mirroring ns_tools's
+    # own default_verifier/verifiers dispatch (resources_servers/ns_tools/app.py) -- added so
+    # brave_search's shared tools (search/browse) can be reused by datasets needing a different
+    # grading strategy than MCQA's box_parser exact-match (e.g. wikidata-triplet-qa's free-text
+    # answers, graded via equivalence_llm_judge) without forking a near-duplicate resources
+    # server. "box_parser" (not "exact_match"/"mcqa") is the name used here since no other
+    # multi-verifier config in this repo has already established a canonical name for this kind
+    # of default/parser-based path -- ns_tools's own default_verifier is math_with_judge itself,
+    # not a plain-parser fallback, so there's no existing convention to match.
+    default_verifier: str = "box_parser"
+    verifiers: Dict[str, ResourcesServerRef] = Field(default_factory=dict)
+
 
 class BaseSearchQueryRequest(BaseModel):
     query: str
@@ -106,7 +119,14 @@ class BaseGetSearchQueryResponse(BaseModel):
 
 
 class BraveSearchRunRequest(BaseRunRequest):
+    model_config = ConfigDict(extra="allow")
+
     expected_answer: str
+
+    # [CUSTOM-VERIFIER-DISPATCH 2026-11-06] Optional per-row verifier selection -- see
+    # BraveSearchResourcesServerConfig.default_verifier/verifiers. None (the default) preserves
+    # today's behavior for all existing MCQA rows, which carry no such field.
+    verifier_type: Optional[str] = None
 
 
 class BraveSearchVerifyRequest(BraveSearchRunRequest, BaseVerifyRequest):
@@ -114,7 +134,10 @@ class BraveSearchVerifyRequest(BraveSearchRunRequest, BaseVerifyRequest):
 
 
 class BraveSearchVerifyResponse(BaseVerifyResponse):
+    model_config = ConfigDict(extra="allow")
+
     parsed_option: Optional[str] = None
+    delegated_response: Optional[Dict[str, Any]] = None
 
 
 def box_parser(output_str: str) -> Optional[str]:
@@ -294,13 +317,36 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
             self._mcp_exit_stack = None
             self._mcp_session = None
 
+    async def _call_search_tool(self, body: BaseSearchQueryRequest):
+        return await self._mcp_session.call_tool(
+            "brave_web_search", {"query": body.query, "count": self.config.max_results}
+        )
+
     async def search(self, body: BaseSearchQueryRequest) -> BaseGetSearchQueryResponse:
         try:
             if self._rate_limiter is not None:
                 await self._rate_limiter.acquire_lock()
-            result = await self._mcp_session.call_tool(
-                "brave_web_search", {"query": body.query, "count": self.config.max_results}
-            )
+            try:
+                result = await self._call_search_tool(body)
+            except Exception as e:
+                # [CUSTOM-SEARCH-MCP-RECONNECT 2026-11-05] `_mcp_session` is connected once at
+                # startup and kept alive for the whole process lifetime (see the module
+                # docstring), with no reconnect logic -- confirmed directly against a real job's
+                # rollout data that once this one long-lived session breaks (any transport-level
+                # exception here), every subsequent search() call fails forever, for the rest of
+                # the job. Since we never pinned down the exact exception that kills it, self-heal
+                # regardless of cause: tear down the stale session/exit stack and reconnect once,
+                # then retry the call exactly once before falling back to the generic error
+                # response below. `_close_mcp_session()` must run first -- `_connect_mcp_session()`
+                # just overwrites `_mcp_exit_stack` with a fresh `AsyncExitStack()` and would
+                # otherwise leak the old streams/process pipes on every reconnect over a long job.
+                logger.warning(
+                    f"brave_search.search() call_tool failed: {type(e).__name__}: {e} -- "
+                    "attempting one MCP session reconnect + retry."
+                )
+                await self._close_mcp_session()
+                await self._connect_mcp_session()
+                result = await self._call_search_tool(body)
             text = "\n".join(part.text for part in result.content if hasattr(part, "text"))
             if result.isError:
                 return BaseGetSearchQueryResponse(search_results=f"Error: {text}")
@@ -317,8 +363,26 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
         # Brave's MCP server exposes no page-fetch tool, so this is unchanged from
         # google_search's browse() -- fetching/cleaning a page is orthogonal to which search
         # backend produced the URL.
+        #
+        # [CUSTOM-BROWSE-HTTPX-FETCH 2026-11-05] Was trafilatura.fetch_url(body.url) -- its own
+        # urllib3-based downloader cannot use our plain HTTP forward proxy under any
+        # configuration: confirmed directly on a real air-gapped compute node. trafilatura's
+        # PROXY_URL detection (trafilatura/downloads.py) is gated behind
+        # `from urllib3.contrib.socks import SOCKSProxyManager` succeeding (silently falls back
+        # to None, i.e. no proxy at all, if the optional `pysocks` dependency isn't installed --
+        # it isn't, here), and even with pysocks installed, SOCKSProxyManager only understands
+        # socks4/socks5 URLs and raises "Unable to determine SOCKS version" against our plain
+        # http://squid proxy URL. Fetching with httpx instead sidesteps this entirely --
+        # confirmed working end-to-end on the same compute node (real 200s, real extracted
+        # content) -- and reuses this module's own existing, already-reasoned exception to the
+        # aiohttp mandate (see the module docstring: MCP tool calls, and now this fetch, happen
+        # at most a few times per rollout turn, not at the 16k-concurrent-request scale that
+        # mandate is about). trafilatura is still used for the network-free HTML-to-text
+        # extraction step below, which is the part actually worth keeping it for.
         try:
-            html = trafilatura.fetch_url(body.url)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                response = await client.get(body.url)
+            html = response.text if response.status_code == 200 else None
             if html:
                 text = trafilatura.extract(html)
                 if text and len(text.split()) > 10000:
@@ -337,14 +401,38 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
             return BaseGetPageContentResponse(page_content=f"Error: Unexpected error = {str(e)}")
 
     async def verify(self, body: BraveSearchVerifyRequest) -> BraveSearchVerifyResponse:
-        expected_answer = body.expected_answer
-        response_text = _extract_last_assistant_text(body)
-        parsed_option = box_parser(response_text)
-        if parsed_option == expected_answer:
-            reward = 1.0
-        else:
-            reward = 0.0
-        return BraveSearchVerifyResponse(**body.model_dump(), reward=reward, parsed_option=parsed_option)
+        # [CUSTOM-VERIFIER-DISPATCH 2026-11-06] Mirrors ns_tools.app.py's verify() dispatch
+        # (resources_servers/ns_tools/app.py) -- the default/box_parser path stays in-process
+        # (no self-HTTP-call) since it's this server's own original logic, not a delegation
+        # target; any other verifier_type (e.g. equivalence_llm_judge, for wikidata-triplet-qa's
+        # free-text answers sharing these same search/browse tools) delegates over HTTP to the
+        # resources server registered for it in `verifiers`, exactly like ns_tools delegates to
+        # math_with_judge.
+        verifier_type = body.verifier_type or self.config.default_verifier
+
+        if verifier_type == self.config.default_verifier:
+            expected_answer = body.expected_answer
+            response_text = _extract_last_assistant_text(body)
+            parsed_option = box_parser(response_text)
+            reward = 1.0 if parsed_option == expected_answer else 0.0
+            return BraveSearchVerifyResponse(**body.model_dump(), reward=reward, parsed_option=parsed_option)
+
+        if verifier_type not in self.config.verifiers:
+            raise ValueError(
+                f"Unknown verifier: {verifier_type}. Configure it in 'verifiers' or check 'default_verifier'."
+            )
+
+        verifier_ref = self.config.verifiers[verifier_type]
+        response = await self.server_client.post(
+            server_name=verifier_ref.name,
+            url_path="/verify",
+            json=body.model_dump(),
+        )
+        result = await response.json()
+        if "reward" not in result:
+            raise ValueError(f"Verifier did not return 'reward' field. Response: {result}")
+
+        return BraveSearchVerifyResponse(**body.model_dump(), reward=result["reward"], delegated_response=result)
 
 
 if __name__ == "__main__":
