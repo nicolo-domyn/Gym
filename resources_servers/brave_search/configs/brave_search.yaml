@@ -29,6 +29,20 @@ brave_search:
       rate_limit_window_sec: 1
       rate_limit_count: 30 # Brave Search API: 30 requests/second
       rate_limit_max_wait_sec: 10
+      # Per-row verifier dispatch (see app.py's [CUSTOM-VERIFIER-DISPATCH] verify()), mirroring
+      # ns_tools.yaml's own default_verifier/verifiers block. box_parser (this server's own
+      # MCQA exact-match logic) stays the default for existing rows with no verifier_type;
+      # equivalence_llm_judge is available for datasets needing free-text grading (e.g.
+      # wikidata-triplet-qa) while sharing these same search/browse tools.
+      default_verifier: box_parser
+      verifiers:
+        # Key is the literal verifier_type string finer-flows' data sets; `name` is the
+        # actual server instance it resolves to -- wikidata_judge (see wikidata_judge.yaml),
+        # not the default STEM-flavored equivalence_llm_judge instance. See
+        # wikidata_judge.yaml's own comment for why.
+        equivalence_llm_judge:
+          type: resources_servers
+          name: wikidata_judge
 brave_search_simple_agent:
   responses_api_agents:
     simple_agent:
