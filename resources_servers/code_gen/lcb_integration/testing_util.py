@@ -27,13 +27,16 @@ import traceback
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from io import StringIO
+from io import BytesIO, StringIO
 
 # from pyext import RuntimeModule
 from types import ModuleType
 
 # used for testing the code that reads from input
 from unittest.mock import mock_open, patch
+
+import math
+import os
 
 import numpy as np
 
@@ -88,7 +91,10 @@ class Capturing(list):
         sys.stdout = self._stdout
 
 
-# Custom mock for sys.stdin that supports buffer attribute
+# sys.stdin replacement for stdin programs. It behaves like a real stream:
+# readline() keeps the newline and returns "" at EOF, iteration yields lines,
+# and sys.stdin.buffer is a separate byte stream over the same input (the old
+# mock was not iterable and its buffer.readline() always returned line 1).
 class MockStdinWithBuffer:
     def __init__(self, inputs: str):
         self.inputs = inputs
@@ -96,13 +102,22 @@ class MockStdinWithBuffer:
         self.buffer = MockBuffer(inputs)
 
     def read(self, *args):
-        return self.inputs
+        return self._stringio.read(*args)
 
     def readline(self, *args):
         return self._stringio.readline(*args)
 
     def readlines(self, *args):
-        return self.inputs.split("\n")
+        return self._stringio.readlines(*args)
+
+    def __iter__(self):
+        return iter(self._stringio.readline, "")
+
+    def fileno(self):
+        return 0
+
+    def isatty(self):
+        return False
 
     def __getattr__(self, name):
         # Delegate other attributes to StringIO
@@ -111,14 +126,57 @@ class MockStdinWithBuffer:
 
 class MockBuffer:
     def __init__(self, inputs: str):
-        self.inputs = inputs.encode("utf-8")  # Convert to bytes
+        self.inputs = inputs.encode("utf-8")
+        self._bytesio = BytesIO(self.inputs)
 
     def read(self, *args):
-        # Return as byte strings that can be split
-        return self.inputs
+        return self._bytesio.read(*args)
 
     def readline(self, *args):
-        return self.inputs.split(b"\n")[0] + b"\n"
+        return self._bytesio.readline(*args)
+
+    def readlines(self, *args):
+        return self._bytesio.readlines(*args)
+
+    def __iter__(self):
+        return iter(self._bytesio.readline, b"")
+
+    def __getattr__(self, name):
+        return getattr(self._bytesio, name)
+
+
+_REAL_OPEN = open
+_REAL_OS_READ = os.read
+_STDIN_PATHS = (0, "/dev/stdin", "/proc/self/fd/0")
+
+
+def _make_stdin_open(inputs: str):
+    """`open` that serves the test input for fd 0 and /dev/stdin.
+
+    Solutions write `open(0).read()` or `open(0, "rb")`. The exec'd code
+    resolves `open` through `from io import *` (io.open), so patching
+    builtins.open alone never reached it, and fd 0 of the grader is empty.
+    Other files keep the previous behaviour (mock_open over the input).
+    """
+    fallback = mock_open(read_data=inputs)
+
+    def _open(file, mode="r", *args, **kwargs):
+        if file in _STDIN_PATHS:
+            if "b" in mode:
+                return BytesIO(inputs.encode("utf-8"))
+            return StringIO(inputs)
+        return fallback(file, mode, *args, **kwargs)
+
+    return _open
+
+
+def _make_os_read(stream: "MockBuffer"):
+    def _read(fd, n):
+        if fd == 0:
+            return stream.read(n)
+        return _REAL_OS_READ(fd, n)
+
+    return _read
 
 
 def clean_if_name(code: str) -> str:
@@ -171,27 +229,36 @@ def call_method(method, inputs):
     if isinstance(inputs, list):
         inputs = "\n".join(inputs)
 
-    inputs_line_iterator = iter(inputs.split("\n"))
-
-    # Create custom stdin mock with buffer support
     mock_stdin = MockStdinWithBuffer(inputs)
+    stdin_open = _make_stdin_open(inputs)
+    # The exec'd module binds `open` from `from io import *`; patch that name
+    # in the solution's own globals as well as in builtins.
+    method_globals = getattr(method, "__globals__", {})
+    saved_open = method_globals.get("open", None)
+    had_open = "open" in method_globals
+    # make_function hoists imports to module level, so `from sys import stdin`
+    # bound the real stream before sys.stdin is patched: rebind those names.
+    real_stdin = {id(sys.stdin), id(sys.__stdin__)}
+    saved_stdin = {k: v for k, v in method_globals.items() if id(v) in real_stdin}
 
-    # sys.setrecursionlimit(10000)
-
-    # @patch('builtins.input', side_effect=inputs.split("\n"))
-    @patch("builtins.open", mock_open(read_data=inputs))
-    @patch("sys.stdin", mock_stdin)  # Use our custom mock instead of StringIO
-    @patch("sys.stdin.readline", lambda *args: next(inputs_line_iterator))
-    @patch("sys.stdin.readlines", lambda *args: inputs.split("\n"))
-    @patch("sys.stdin.read", lambda *args: inputs)
-    # @patch('sys.stdout.write', print)
+    @patch("builtins.open", stdin_open)
+    @patch("io.open", stdin_open)
+    @patch("sys.stdin", mock_stdin)
+    @patch("os.read", _make_os_read(mock_stdin.buffer))
     def _inner_call_method(_method):
+        method_globals["open"] = stdin_open
+        for name in saved_stdin:
+            method_globals[name] = mock_stdin
         try:
             return _method()
         except SystemExit:
             pass
         finally:
-            pass
+            method_globals.update(saved_stdin)
+            if had_open:
+                method_globals["open"] = saved_open
+            else:
+                method_globals.pop("open", None)
 
     return _inner_call_method(method)
 
@@ -204,19 +271,23 @@ def get_function(compiled_sol, fn_name: str):  # type: ignore
         return
 
 
-def compile_code(code: str, timeout: int):
+def compile_code(code: str, timeout: int, fn_name: str | None = None):
+    """Exec the code; return the object `fn_name` is looked up on.
+
+    Call-based LeetCode-style answers define `class Solution`: the method is
+    taken from an instance when Solution has `fn_name`. The old check
+    (`"class Solution" in code`) also fired on stdin programs that merely
+    mention the text, and on solutions whose `Solution` lacks the function,
+    and failed them.
+    """
     signal.alarm(timeout)
     try:
         tmp_sol = ModuleType("tmp_sol", "")
         exec(code, tmp_sol.__dict__)
-        if "class Solution" in code:
-            # leetcode wraps solutions in `Solution`
-            # this is a hack to check if it is leetcode solution or not
-            # currently livecodebench only supports LeetCode but
-            # else condition allows future extensibility to other platforms
-            compiled_sol = tmp_sol.Solution()
+        solution_cls = getattr(tmp_sol, "Solution", None)
+        if fn_name and isinstance(solution_cls, type) and hasattr(solution_cls, fn_name):
+            compiled_sol = solution_cls()
         else:
-            # do nothing in the other case since function is accesible
             compiled_sol = tmp_sol
 
         assert compiled_sol is not None
@@ -224,6 +295,47 @@ def compile_code(code: str, timeout: int):
         signal.alarm(0)
 
     return compiled_sol
+
+
+# Absolute/relative tolerance for floating-point answers. Statements that print
+# reals almost always accept 1e-6 (or looser); exact decimal comparison failed
+# correct answers such as 0.400000000 vs 0.400000000000000022.
+FLOAT_TOL = 1e-6
+
+
+def _floats_close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=FLOAT_TOL, abs_tol=FLOAT_TOL)
+
+
+def values_match(prediction, expected) -> bool:
+    """Compare a call-based return value with the expected JSON value.
+
+    Lists/tuples and dicts compare element-wise; floats with FLOAT_TOL (also
+    inside lists); ints exactly; bools only with bools. numpy values are
+    converted with .tolist() first, so an array return value no longer makes
+    the comparison (and the reward computation) raise.
+    """
+    if hasattr(prediction, "tolist") and not isinstance(prediction, (str, bytes)):
+        try:
+            prediction = prediction.tolist()
+        except Exception:
+            pass
+    if isinstance(expected, bool) or isinstance(prediction, bool):
+        return isinstance(expected, bool) and isinstance(prediction, bool) and prediction == expected
+    if isinstance(expected, (int, float)) and isinstance(prediction, (int, float)):
+        if isinstance(expected, int) and isinstance(prediction, int):
+            return prediction == expected
+        return _floats_close(float(prediction), float(expected))
+    if isinstance(expected, (list, tuple)) and isinstance(prediction, (list, tuple)):
+        return len(prediction) == len(expected) and all(
+            values_match(p, e) for p, e in zip(prediction, expected)
+        )
+    if isinstance(expected, dict) and isinstance(prediction, dict):
+        return prediction.keys() == expected.keys() and all(values_match(prediction[k], expected[k]) for k in expected)
+    try:
+        return bool(prediction == expected)
+    except Exception:
+        return False
 
 
 def convert_line_to_decimals(line: str) -> tuple[bool, list[Decimal]]:
@@ -245,7 +357,7 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
     # call-based clean up logic
     # need to wrap in try-catch logic after to catch the correct errors, but for now this is fine.
     code = import_string + "\n\n" + code
-    compiled_sol = compile_code(code, timeout)
+    compiled_sol = compile_code(code, timeout, fn_name=fn_name)
 
     if compiled_sol is None:
         return
@@ -271,24 +383,20 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
             total_execution += time.time() - start
             signal.alarm(0)
 
-            # don't penalize model if it produces tuples instead of lists
-            # ground truth sequences are not tuples
-            if isinstance(prediction, tuple):
-                prediction = list(prediction)
-
-            tmp_result = prediction == gt_out
-
-            # handle floating point comparisons
-            # Adopted improved floating point comparison from https://huggingface.co/nvidia/Nemotron-Cascade-8B/blob/main/evaluation/eval/tools/code_verifier_utils.py#L326-L335
-            try:
-                tmp_result = tmp_result or (json.dumps(prediction) == json.dumps(gt_out))
-            except Exception:
-                pass
-
-            try:
-                tmp_result = tmp_result or (np.allclose(float(prediction), float(gt_out)))
-            except Exception:
-                pass
+            tmp_result = values_match(prediction, gt_out)
+            if not tmp_result:
+                # Previous rules, kept as fallbacks: json.dumps equality and
+                # np.allclose of scalars.
+                try:
+                    tmp_result = json.dumps(prediction) == json.dumps(gt_out)
+                except Exception:
+                    pass
+            if not tmp_result:
+                try:
+                    tmp_result = bool(np.allclose(float(prediction), float(gt_out)))
+                except Exception:
+                    pass
+            tmp_result = bool(tmp_result)
 
             all_results.append(tmp_result)
 
@@ -437,6 +545,19 @@ def grade_stdio(
                 return all_results, WA_send_args
 
             if decimal_prediction_line == decimal_gtout_line:
+                continue
+
+            ## CASE 3: reals within FLOAT_TOL. Only when a token is written as
+            ## a real (has '.', 'e' or 'E'), so integer answers stay exact.
+            tokens = stripped_prediction_line.split() + stripped_gt_out_line.split()
+            if (
+                len(decimal_prediction_line) == len(decimal_gtout_line)
+                and any(c in tok for tok in tokens for c in ".eE")
+                and all(
+                    p == g or (p.is_finite() and g.is_finite() and _floats_close(float(p), float(g)))
+                    for p, g in zip(decimal_prediction_line, decimal_gtout_line)
+                )
+            ):
                 continue
 
             all_results.append(-2)
