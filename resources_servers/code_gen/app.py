@@ -218,7 +218,7 @@ class CompCodingResourcesServer(SimpleResourcesServer):
             reward=(
                 self.config.reasoning_format_penalty
                 if has_violation
-                else (1.0 if all(r == True for r in result) else 0.0)
+                else (1.0 if all_tests_passed(result) else 0.0)
             ),
             extracted_model_output=model_out,
             extracted_model_code=code,
@@ -228,6 +228,18 @@ class CompCodingResourcesServer(SimpleResourcesServer):
             reasoning_format_violation_rate=1.0 if has_violation else 0.0,
             difficulty=difficulty,
         )
+
+
+def all_tests_passed(result) -> bool:
+    """True when every per-test result is the boolean True.
+
+    Results are True, or negative error codes (-2 wrong answer, -3 timeout,
+    -4 runtime error). `r == True` raised "truth value of an array is
+    ambiguous" when a result was a numpy array, crashing verify.
+    """
+    if not result:
+        return False
+    return all(isinstance(r, bool) and r for r in result)
 
 
 if __name__ == "__main__":
