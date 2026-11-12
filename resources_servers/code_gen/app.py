@@ -57,6 +57,8 @@ class UnitTests(BaseModel):
     inputs: List[str]
     outputs: List[str]
     fn_name: Optional[str] = None
+    # stdin problems whose statement accepts the answer in any letter case.
+    case_insensitive: bool = False
 
 
 class CompCodingRunRequest(BaseRunRequest):

@@ -442,6 +442,7 @@ def grade_stdio(
     all_inputs: list,
     all_outputs: list,
     timeout: int,
+    case_insensitive: bool = False,
 ):
     ## runtime doesn't interact well with __name__ == '__main__'
     code = clean_if_name(code)
@@ -525,8 +526,10 @@ def grade_stdio(
                 f"Wrong answer at {output_line_idx=}: {truncatefn(stripped_prediction_line)} != {truncatefn(stripped_gt_out_line)}"
             )
 
-            ## CASE 1: exact match
+            ## CASE 1: exact match (any letter case when the statement allows it)
             if stripped_prediction_line == stripped_gt_out_line:
+                continue
+            if case_insensitive and stripped_prediction_line.lower() == stripped_gt_out_line.lower():
                 continue
 
             ## CASE 2: element-wise comparision
@@ -637,6 +640,7 @@ def run_test(in_outs, test=None, debug=False, timeout=6):
                     all_inputs=in_outs["inputs"],
                     all_outputs=in_outs["outputs"],
                     timeout=timeout,
+                    case_insensitive=bool(in_outs.get("case_insensitive")),
                 )
                 return results, metadata
             except Exception as e:

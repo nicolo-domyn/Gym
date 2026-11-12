@@ -109,3 +109,9 @@ def test_all_tests_passed():
     assert not all_tests_passed([True, -2])
     assert not all_tests_passed([True, np.array([True, False])])
     assert not all_tests_passed([])
+
+
+def test_case_insensitive_flag():
+    code = "print('yes')"
+    assert grade_stdio(code, [""], ["YES"], timeout=5)[0] == [-2]
+    assert grade_stdio(code, [""], ["YES"], timeout=5, case_insensitive=True)[0] == [True]
