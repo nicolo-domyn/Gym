@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import json
+import os
 import re
 import sys
 from asyncio import Semaphore
@@ -183,6 +184,29 @@ def runner_ray_remote(runner: Callable, params: dict[str, Any]) -> Any:
     return runner(**params)
 
 
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+
+
+def _container_proxy_env() -> dict[str, str]:
+    """[CUSTOM] This server's forward-proxy variables, for the task container only.
+
+    Training exports the proxy into the Gym servers' environment (nemo_rl
+    maybe_enable_proxy), but the Ray workers that run the trials inherit the raylet's
+    environment, which has none: without this, harbor containers have no internet in
+    training (verifier `pip install` of test requirements fails), while they do in a
+    rollout run whose Ray workers inherit the proxy.
+
+    SINGULARITYENV_ makes Singularity set the variables inside the container only. The
+    Ray worker itself must not get HTTP(S)_PROXY: its httpx client would send the policy
+    calls (cluster IPs, which httpx does not match against NO_PROXY CIDR entries) through
+    the proxy, which rejects ports other than 80/443.
+
+    Returns:
+        SINGULARITYENV_<var> for each proxy variable set here; empty without a proxy.
+    """
+    return {f"SINGULARITYENV_{var}": os.environ[var] for var in _PROXY_ENV_VARS if os.environ.get(var)}
+
+
 class HarborAgent(SimpleResponsesAPIAgent):
     config: HarborAgentConfig
     sem: Semaphore = None
@@ -240,7 +264,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 params = dict(
                     job_config_dict=job_config_dict,
                 )
-                future = runner_ray_remote.remote(_run_harbor_job_sync, params)
+                # options() replaces the decorator's runtime_env: keep py_executable.
+                future = runner_ray_remote.options(
+                    runtime_env={"py_executable": sys.executable, "env_vars": _container_proxy_env()},
+                ).remote(_run_harbor_job_sync, params)
                 trial_dir_path = await asyncio.to_thread(ray.get, future)
                 trial_dir = Path(trial_dir_path)
 
