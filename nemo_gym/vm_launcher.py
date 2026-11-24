@@ -418,6 +418,13 @@ def _spawn(
         f'mount -o ro /dev/vd{chr(ord("c") + i)} {shlex.quote(mount_path)}"'
         for i, (_, mount_path) in enumerate(block_device_mounts)
     )
+    # [CUSTOM-VM-READY-AFTER-MOUNTS 2026-11-20] ensure_vm's lock-free fast path treats
+    # "ssh_port exists + SSH answers" as ready. The port used to be published right after
+    # vm_start, so a concurrent rollout could start once sshd was up but before the 9p shares
+    # and block devices below were mounted -- job 64969854: `singularity` in the VM failed with
+    # "lstat /leonardo_scratch/large: no such file or directory" (first share mounted, second
+    # not yet). Publish it only after every mount, and drop a stale one from a previous boot
+    # first, so other callers wait on the spawn lock instead.
     script = f"""
 set -euo pipefail
 export VM_QEMU_PREFIX_DIR={shlex.quote(os.path.join(qemu_dir, "prefix"))}
@@ -426,16 +433,17 @@ export VM_EXTRA_BINDS={shlex.quote(extra_binds)}
 export VM_EXTRA_DRIVES={shlex.quote(extra_drives)}
 source {shlex.quote(_VM_LIB_SH)}
 WORK={shlex.quote(work)}
+rm -f {shlex.quote(_ssh_port_path())}
 vm_make_overlay {shlex.quote(golden)} "$WORK/disk.qcow2"
 vm_make_key "$WORK"
 vm_root_user_data "$WORK/user-data" "$WORK/id.pub"
 vm_make_seed "$WORK/user-data" "$WORK/seed.img" "$WORK"
 vm_start {_vcpus()} {_mem_mb()} "$WORK/disk.qcow2" "$WORK/seed.img" "$WORK" {shares}
-echo "$VM_SSH_PORT" > {shlex.quote(_ssh_port_path())}
 echo "$VM_PID" > {shlex.quote(_pid_path())}
 vm_wait_ssh "$WORK/id" "$VM_SSH_PORT" "$VM_PID" "$WORK" {int(_BOOT_TIMEOUT_S)}
 {mount_cmds}
 {block_device_cmds}
+echo "$VM_SSH_PORT" > {shlex.quote(_ssh_port_path())}
 """
     result = subprocess.run(["bash", "-c", script], stdout=log_file, stderr=subprocess.STDOUT)
     log_file.close()

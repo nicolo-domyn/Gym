@@ -104,6 +104,9 @@ git checkout $agent_framework_commit
 #     surfaces a real traceback
 #   - swebench_pin: fixes poetry.lock's `swebench` git dependency pin, which points at a commit
 #     that's no longer fetchable. Must run before `make build` below.
+#   - atomic_nemo_gym_metrics: serializes and makes atomic every OpenHands update of
+#     nemo_gym_metrics.json (concurrent unlocked writers corrupted it, failing the /run).
+#     Touches openhands/, so openhands_pkg.img must be rebuilt afterwards (presync.sbatch).
 echo "Applying CUSTOM-SWESMITH dataset-type patch to OpenHands' run_infer.py..."
 python3 "$(dirname "${BASH_SOURCE[0]}")/patch_openhands_swesmith_dataset_type.py" "$openhands_dir"
 
@@ -118,6 +121,9 @@ python3 "$(dirname "${BASH_SOURCE[0]}")/patch_openhands_pythonunbuffered.py" "$o
 
 echo "Applying CUSTOM-SWEBENCH-PIN patch to OpenHands' poetry.lock..."
 python3 "$(dirname "${BASH_SOURCE[0]}")/patch_openhands_swebench_pin.py" "$openhands_dir"
+
+echo "Applying CUSTOM-ATOMIC-NG-METRICS patch to OpenHands' nemo_gym_metrics.json writers..."
+python3 "$(dirname "${BASH_SOURCE[0]}")/patch_openhands_atomic_nemo_gym_metrics.py" "$openhands_dir"
 
 # Build OpenHands
 echo "Building OpenHands (this may take 5-10 minutes)..."
