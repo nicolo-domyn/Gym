@@ -59,7 +59,6 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.profiling import Profiler
-from nemo_gym.vm_launcher import ensure_vm, run_in_vm
 from responses_api_models.vllm_model.app import VLLMConverter, split_responses_input_output_items
 
 
@@ -124,34 +123,6 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
         default="docker://swebench/sweb.eval.x86_64.{instance_id}", description="Container path template"
     )
 
-    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2
-    # images are built with root-owned content. To circumvent this, run them from inside a VM,
-    # where we are root. 
-    # In detail,the  apptainer command is run inside a per-node QEMU/KVM VM sidecar (see
-    # nemo_gym/vm_launcher.py). We only create one persistent VM per node, shared across every
-    # rollout happening in that node -- see vm_launcher.py's module docstring for the full 
-    # lifecycle description of the VM.
-    vm_golden_image_dir: Optional[str] = Field(
-        default=None,
-        description=(
-            "[CUSTOM-VM-SIDECAR] Directory holding golden.qcow2 and the unprivileged QEMU "
-            "install. Required when a job's data includes any of "
-            "SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2 rows "
-            "-- see _uses_vm_sidecar()."
-        ),
-    )
-    vm_lustre_share_roots: list[str] = Field(
-        default_factory=list,
-        description=(
-            "[CUSTOM-VM-SIDECAR] Host directories shared into the VM via virtio-9p at boot, at "
-            "the same absolute path, so the existing _build_apptainer_command mount strings "
-            "need no changes. Must cover every host path that command binds for the affected "
-            "dataset types: the container_formatter image directory/directories, "
-            "base_results_dir's root (persistent_dir lives under it), and the "
-            "openhands/swebench/r2e_gym/swe_rebench/swesmith setup dirs' root(s)."
-        ),
-    )
-
     swebench_tests_timeout: int = Field(default=30 * 60, description="Timeout for running tests (seconds)")
 
     swebench_agent_timeout: int = Field(default=45 * 60, description="Timeout for running the agent (seconds)")
@@ -168,6 +139,27 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
             "that ship SingularityPRO/Singularity but have no 'apptainer' binary on PATH -- "
             "Apptainer and Singularity are CLI-compatible forks, so 'exec'/mount-flag syntax "
             "is unaffected by which binary name is used."
+        ),
+    )
+
+    # [CUSTOM-FAKEROOT 2026-11-25] SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench-V1/SWE-rebench-V2 images
+    # are built with root-owned content, which `--writable-tmpfs` alone can't write to without
+    # real root. Confirmed via a real compute-node debug job (boost_qos_dbg, 2026-11-25): this
+    # cluster's login nodes have unprivileged user namespaces disabled
+    # (/proc/sys/user/max_user_namespaces = 0), but compute nodes do not -- `apptainer exec
+    # --fakeroot` works there via a root-mapped namespace (no /etc/subuid entry needed), verified
+    # end-to-end with a real write landing as a tracked git diff inside a root-owned repo path.
+    # This replaces the now-removed QEMU/KVM VM-sidecar workaround (nemo_gym/vm_launcher.py,
+    # removed same date) that booted a per-node VM to get real root another way. Independent of
+    # apptainer_binary: that field is purely a binary-name shim; this field is whether THIS
+    # cluster's apptainer install can actually do --fakeroot at all.
+    apptainer_use_fakeroot: bool = Field(
+        default=False,
+        description=(
+            "Pass --fakeroot to apptainer exec so SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench rows "
+            "can write their root-owned task-repo paths directly, without any VM/copy-out "
+            "workaround. Requires unprivileged user namespaces to be available where the job "
+            "runs (true on this cluster's compute nodes, false on its login nodes)."
         ),
     )
 
@@ -460,35 +452,6 @@ class BaseDatasetHarnessProcessor(BaseModel):
     def _get_command_sleep_until_predictions_file(self) -> str:
         return f"until [ -f {self.config.output_for_eval_mounted_path} ]; do sleep 5; done"
 
-    # [CUSTOM-VM-SIDECAR-PREFLIGHT 2026-11-02] VM-sidecar .img readiness check.
-    #
-    # Note on blast radius: this runs inside SWEBenchWrapper.model_post_init(), which executes
-    # exactly once per training job, synchronously, during construction of the single
-    # job-wide `NemoGym` Ray actor. A raised exception here is not isolated to one rollout.
-    # It IS somewhat undermined by nemo_rl/environments/nemo_gym.py's
-    # `@ray.remote(max_restarts=-1, max_task_retries=-1)` on NemoGym -- Ray will retry actor
-    # construction indefinitely rather than ever surfacing this as fatal to the driver, so a
-    # raised exception alone may manifest as a silent, repeating restart loop rather than a
-    # clean job death. The loud, repeated log line below is the fallback for that case: every
-    # restart attempt re-runs this check and re-prints the same actionable message, so the
-    # failure is at least immediately visible to anyone tailing the job, even when it isn't
-    # cleanly fatal at the SLURM level.
-    def _require_image_ready(self, label: str, image_path: Path) -> None:
-        if image_path.exists():
-            return
-        logger.error(
-            "=" * 88 + "\n"
-            f"FATAL: {label} VM-sidecar image is missing at {image_path}\n"
-            "This is no longer built lazily at job runtime -- it must be built ahead of time.\n"
-            "Fix: re-run presync with BUILD_SWE_ENVS=true (scripts/presync.sbatch) before "
-            "launching this job.\n" + "=" * 88
-        )
-        raise RuntimeError(
-            f"{label} VM-sidecar image missing at {image_path} -- "
-            "run presync with BUILD_SWE_ENVS=true before launching this job."
-        )
-
-
 class SweBenchDatasetProcessor(BaseDatasetHarnessProcessor):
     def setup(self) -> Path:
         swebench_repo = "https://github.com/HeyyyyyyG/SWE-bench.git"
@@ -504,7 +467,6 @@ class SweBenchDatasetProcessor(BaseDatasetHarnessProcessor):
 
             if swebench_dir.exists():
                 print(f"SWE-bench already set up at {setup_dir}")
-                self._require_image_ready("SWE-bench", setup_dir / "swebench.img")
                 return setup_dir
 
             print(f"Setting up SWE-bench environment at {setup_dir}...", flush=True)
@@ -517,11 +479,6 @@ SWEBENCH_REPO={swebench_repo} \\
 SWEBENCH_COMMIT={swebench_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
-
-            # The venv was just freshly rebuilt here -- its VM-sidecar image is now guaranteed
-            # stale (see BaseDatasetHarnessProcessor._require_image_ready's own docstring for
-            # why that rebuild is no longer done inline).
-            self._require_image_ready("SWE-bench", setup_dir / "swebench.img")
             return setup_dir
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
@@ -653,7 +610,6 @@ class R2EGymDatasetProcessor(BaseDatasetHarnessProcessor):
                 result = subprocess_run([str(python_bin), "-c", "import r2egym"])
                 if result.returncode == 0:
                     print(f"R2E-Gym already set up at {setup_dir}", flush=True)
-                    self._require_image_ready("R2E-Gym", setup_dir / "r2e_gym.img")
                     return setup_dir
 
                 print("R2E-Gym directory exists but module not properly installed, rebuilding...", flush=True)
@@ -670,11 +626,6 @@ EVAL_HARNESS_REPO={eval_harness_repo} \\
 EVAL_HARNESS_COMMIT={eval_harness_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
-
-            # The venv was just freshly rebuilt here -- its VM-sidecar image is now guaranteed
-            # stale (see BaseDatasetHarnessProcessor._require_image_ready's own docstring for
-            # why that rebuild is no longer done inline).
-            self._require_image_ready("R2E-Gym", setup_dir / "r2e_gym.img")
             return setup_dir
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
@@ -759,7 +710,6 @@ class SWESmithDatasetProcessor(BaseDatasetHarnessProcessor):
                 result = subprocess_run([str(python_bin), "-c", "from swesmith.profiles import registry"])
                 if result.returncode == 0:
                     print(f"SWE-smith already set up at {setup_dir}", flush=True)
-                    self._require_image_ready("SWE-smith", setup_dir / "swesmith.img")
                     return setup_dir
 
                 print("SWE-smith directory exists but module not properly installed, rebuilding...", flush=True)
@@ -783,11 +733,6 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
             # once (uv's venv wrappers use hardcoded absolute paths, same reasoning as
             # R2E-Gym/SWE-bench's own setup dirs).
             shutil.copy(driver_src, driver_dst)
-
-            # The venv was just freshly rebuilt here -- its VM-sidecar image is now guaranteed
-            # stale (see BaseDatasetHarnessProcessor._require_image_ready's own docstring for
-            # why that rebuild is no longer done inline).
-            self._require_image_ready("SWE-smith", setup_dir / "swesmith.img")
             return setup_dir
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
@@ -1405,7 +1350,6 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
                 )
                 if result.returncode == 0:
                     print(f"OpenHands already set up at {setup_dir}", flush=True)
-                    self._require_image_ready("OpenHands", setup_dir / "openhands.img")
                     return setup_dir
 
                 print(
@@ -1450,11 +1394,6 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
                 f"-- refusing to proceed with a known-broken venv. Import error was:\n{result.stderr}"
             )
 
-            # The venv was just freshly rebuilt here -- its VM-sidecar image is now guaranteed
-            # stale (built, if at all, from the PREVIOUS venv content) -- see
-            # BaseDatasetHarnessProcessor._require_image_ready's own docstring for why that
-            # rebuild is no longer done inline.
-            self._require_image_ready("OpenHands", setup_dir / "openhands.img")
             return setup_dir
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
@@ -1803,51 +1742,13 @@ class RunOpenHandsAgent(BaseModel):
         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
         log_file = open(log_file_path, "w")
 
-        dataset_name = self.config.problem_info.get("dataset_name")
-        if _uses_vm_sidecar(dataset_name):
-            # [CUSTOM-VM-SIDECAR 2026-10-27] Route through this node's persistent VM sidecar
-            # instead of running the apptainer command directly on the host -- see
-            # nemo_gym/vm_launcher.py's.
-            #
-            # ensure_vm() is a blocking call (subprocess/file-lock based, like
-            # sandbox_launcher.ensure_sandbox()) -- safe to call directly here despite this
-            # being an async method because each rollout is its own Ray task running
-            # asyncio.run() in its own process; there is no other concurrent coroutine sharing
-            # this event loop for a blocking call to stall.
-            #
-            # Do a passthrough of HTTP_PROXY/HTTPS_PROXY (SSH does not punch through
-            # arbitrary environment variables by default).
-            proxy_env = {
-                var: os.environ[var]
-                for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
-                if os.environ.get(var)
-            }
-            # [CUSTOM-VM-SIDECAR-BLOCKDEV 2026-10-28] Every dataset harness's own venv is imaged
-            # as a dedicated read-only block device: these can be though of as basically 
-            # "pre-compiled disks" that are attached to the VM and contain all the files needed
-            # for the harness to work.
-            # Each image shadows ONLY its venv/.venv dir, NOT the whole setup dir.
-            openhands_dir = f"{self.config.openhands_setup_dir}/OpenHands"
-            openhands_image = f"{self.config.openhands_setup_dir}/openhands.img"
-            swebench_dir = f"{self.config.swebench_setup_dir}/SWE-bench"
-            swebench_image = f"{self.config.swebench_setup_dir}/swebench.img"
-            r2e_gym_dir = f"{self.config.r2e_gym_setup_dir}/R2E-Gym"
-            r2e_gym_image = f"{self.config.r2e_gym_setup_dir}/r2e_gym.img"
-            swesmith_dir = f"{self.config.swesmith_setup_dir}/SWE-smith"
-            swesmith_image = f"{self.config.swesmith_setup_dir}/swesmith.img"
-            vm_info = ensure_vm(
-                golden_image_dir=self.config.vm_golden_image_dir,
-                lustre_share_roots=self.config.vm_lustre_share_roots,
-                block_device_mounts=[
-                    (openhands_image, f"{openhands_dir}/.venv"),
-                    (swebench_image, f"{swebench_dir}/venv"),
-                    (r2e_gym_image, f"{r2e_gym_dir}/venv"),
-                    (swesmith_image, f"{swesmith_dir}/venv"),
-                ],
-            )
-            process = await run_in_vm(vm_info, apptainer_cmd, env=proxy_env, stdout=log_file, stderr=log_file)
-        else:
-            process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
+        # [CUSTOM-FAKEROOT 2026-11-25] Previously routed SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench
+        # rows through a per-node QEMU/KVM VM sidecar to get real root for their root-owned
+        # task-repo paths (see git history: nemo_gym/vm_launcher.py, removed same date).
+        # apptainer_use_fakeroot (see _build_apptainer_command) makes that unnecessary: the
+        # apptainer_cmd string already carries --fakeroot when needed, so every row just runs
+        # directly on the host like the non-VM dataset types always did.
+        process = await asyncio.create_subprocess_shell(apptainer_cmd, stdout=log_file, stderr=log_file)
 
         return ActiveContainerCommand(process=process, log_file=log_file, log_file_path=log_file_path)
 
@@ -2162,24 +2063,6 @@ async def _kill_and_reap_process(process: asyncio.subprocess.Process, context: s
         return False
 
 
-# [CUSTOM-VM-SIDECAR 2026-10-27] Which dataset types need the per-node VM sidecar (real root,
-# no --fakeroot) instead of running the apptainer command directly on the host -- see
-# nemo_gym/vm_launcher.py. Exactly the five dataset types that used to call
-# _copy_out_writable_paths for a writable /testbed or /{repo_name}; everything else (Harbor,
-# plain SWE-bench, SWE-bench_Multilingual, nv-internal-1, swe-bench-ext) never hit the
-# root-owned-path problem in the first place and keeps running on the bare host. Module-level
-# (not a method) because it's needed from both SWEBenchWrapper (_build_apptainer_command) and
-# RunOpenHandsAgent (_start_container_command), two different classes in this file.
-def _uses_vm_sidecar(dataset_name: Optional[str]) -> bool:
-    dataset_name = dataset_name or ""
-    return (
-        "SWE-Gym" in dataset_name
-        or "R2E-Gym" in dataset_name
-        or "SWE-smith" in dataset_name
-        or "SWE-rebench" in dataset_name  # covers both V1 and V2
-    )
-
-
 class SWEBenchWrapper(SimpleResponsesAPIAgent):
     config: SWEBenchWrapperConfig
 
@@ -2195,10 +2078,22 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
     def model_post_init(self, context: Any) -> None:
         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-        workspace_root = Path(__file__).parent
+        # [CUSTOM-RESULTS-DIR-OUTSIDE-PACKAGE 2026-11-26] Was `Path(__file__).parent` (this same
+        # swe_agents/ package dir). Every server startup creates a fresh
+        # swebench_results_<session_id> dir here that nothing cleans up outside of a test
+        # fixture -- over months of real job runs this accumulated 115 such directories (some
+        # with 10k+ entries each) directly under the tree setuptools' package discovery walks,
+        # which is what made a plain `uv sync` hang long enough to blow past a 4-hour SLURM job.
+        # Moved outside the package tree entirely so this can't recur. Hardcoded (not
+        # env-var-configurable) for now -- revisit if this needs to be portable to another
+        # cluster/user setup.
+        results_root = Path(
+            f"/leonardo_scratch/fast/BOOST_EUROPA/{os.environ.get('USER', 'nobody')}/swe_agents_results"
+        )
+        results_root.mkdir(parents=True, exist_ok=True)
         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
             run_session_id=run_session_id,
-            base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
+            base_results_dir=results_root / f"swebench_results_{run_session_id}",
             ng_global_config_dict_str=shlex.quote(OmegaConf.to_yaml(get_global_config_dict())),
             model_server_name=self.config.model_server.name,
             openhands_setup_dir=OpenHandsHarnessProcessor(config=self.config).setup(),
@@ -2464,11 +2359,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             f"Searched in paths: {tried_paths}."
         )
 
-    # [CUSTOM-VM-SIDECAR 2026-10-27] SWE-Gym, R2E-Gym, SWE-smith, SWE-rebench-V1, and
-    # SWE-rebench-V2 now run their apptainer command inside the per-node VM sidecar as
-    # real root (see nemo_gym/vm_launcher.py and _uses_vm_sidecar below), so those paths
-    # are directly writable. 
-    # One small quirk: R2E-Gym's held-out tests (/r2e_tests) must stay invisible to the
+    # [CUSTOM-FAKEROOT 2026-11-25] SWE-Gym, R2E-Gym, SWE-smith, SWE-rebench-V1, and
+    # SWE-rebench-V2's task-repo paths are writable directly (see apptainer_use_fakeroot).
+    # One small quirk remains: R2E-Gym's held-out tests (/r2e_tests) must stay invisible to the
     # AGENT, so do an explicit empty-dir bind mount in agent mode.
     def _vm_task_integrity_mount_args(
         self, problem_info: Dict[str, Any], persistent_dir: Path, mode: str
@@ -2548,13 +2441,10 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # This is needed because uv venv has hardcoded absolute paths
             mount_args.append(f"--mount type=bind,src={params.swebench_setup_dir},dst=/swebench_setup")
             mount_args.append(f"--mount type=bind,src={params.swebench_setup_dir},dst={params.swebench_setup_dir}")
-            # [CUSTOM-VENV-RO 2026-11-17] Shadow just the venv subtree read-only, same pattern
-            # as the VM sidecar's block-device mounts ("Each image shadows ONLY its venv/.venv
-            # dir, NOT the whole setup dir" -- see _spawn's block_device_mounts). Plain
-            # SWE-bench never runs inside the VM sidecar (see _uses_vm_sidecar), so unlike
-            # SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench its shared venv has no QEMU-readonly-
-            # block-device backstop -- without this, an in-container `pip install` can corrupt
-            # it for every later rollout in the job. Can't make the whole setup dir read-only:
+            # [CUSTOM-VENV-RO 2026-11-17] Shadow just the venv subtree read-only: the venv is
+            # shared across every concurrent rollout on the node, so without this an in-container
+            # `pip install` can corrupt it for every later rollout in the job. Can't make the
+            # whole setup dir read-only:
             # run_local_evaluation writes its own logs/run_evaluation/<run_id> under
             # {swebench_setup_dir}/SWE-bench before get_run_command's own cp-then-rm-rf copies
             # them out (see that command's cd into /swebench_setup/SWE-bench).
@@ -2594,6 +2484,11 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # print(f"Mounting R2E-Gym setup directory from: {self.r2e_gym_setup_dir}", flush=True)
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst=/r2egym_setup")
             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst={params.r2e_gym_setup_dir}")
+            # [CUSTOM-VENV-RO 2026-11-25] See the matching comment on the plain-SWE-bench venv
+            # mount above -- same reasoning, same shape.
+            r2e_gym_venv = f"{params.r2e_gym_setup_dir}/R2E-Gym/venv"
+            mount_args.append(f"--mount type=bind,src={r2e_gym_venv},dst=/r2egym_setup/R2E-Gym/venv,ro")
+            mount_args.append(f"--mount type=bind,src={r2e_gym_venv},dst={r2e_gym_venv},ro")
             container_commands.append("mkdir -p /root/r2e_tests && cp -a /r2e_tests/. /root/r2e_tests/ || true")
 
         if command.mode == "eval" and "SWE-smith" in data_point["dataset_name"]:
@@ -2602,6 +2497,11 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             # absolute path -- same uv-hardcoded-absolute-paths reasoning as R2E-Gym/SWE-bench.
             mount_args.append(f"--mount type=bind,src={params.swesmith_setup_dir},dst=/swesmith_setup")
             mount_args.append(f"--mount type=bind,src={params.swesmith_setup_dir},dst={params.swesmith_setup_dir}")
+            # [CUSTOM-VENV-RO 2026-11-25] See the matching comment on the plain-SWE-bench venv
+            # mount above -- same reasoning, same shape.
+            swesmith_venv = f"{params.swesmith_setup_dir}/SWE-smith/venv"
+            mount_args.append(f"--mount type=bind,src={swesmith_venv},dst=/swesmith_setup/SWE-smith/venv,ro")
+            mount_args.append(f"--mount type=bind,src={swesmith_venv},dst={swesmith_venv},ro")
 
         if command.mode == "eval" and "SWE-rebench" in data_point["dataset_name"]:
             rebench_setup_dir = params.swe_rebench_setup_dir
@@ -2710,49 +2610,25 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # per-rollout home directory via `-H`, and a separate real scratch directory bound to
         # `$TMPDIR` for tools that write to `/tmp` instead of `$HOME`.
         #
-        # VM-sidecar containers get a guest-local scratch/home dir under /var/tmp instead of the
-        # host-created, 9p-shared persistent_dir used below for the host-direct path: writes made
-        # as root inside the guest do not propagate real ownership back through the 9p share, so
-        # tools that check tmpdir ownership (e.g. pytest) fail against a 9p-backed path. /var/tmp
-        # is used rather than /tmp because the latter is RAM-backed (tmpfs) and shared by every
-        # concurrent rollout on the node. Nothing reclaims this directory automatically, so it is
-        # removed explicitly in the background after each rollout (see below).
-        uses_vm_sidecar = _uses_vm_sidecar(data_point["dataset_name"])
-        if uses_vm_sidecar:
-            guest_scratch_dir = f"/var/tmp/swe_agents_scratch/{params.persistent_dir.name}_{command.mode}"
-            guest_home_dir = f"{guest_scratch_dir}_home"
-            # Capture apptainer's real exit code into `_rc` before backgrounding the cleanup
-            # `rm -rf`: backgrounding as the script's last statement would otherwise reset `$?`
-            # to the backgrounding operator's own (always-0) status.
-            #
-            # `--contain` only gives `-H {guest_home_dir}` an implicit bind; `--env TMPDIR=...`
-            # does not get one, so guest_scratch_dir also needs its own explicit same-path bind
-            # mount to be visible inside the container.
-            apptainer_cmd = (
-                f"mkdir -p {guest_scratch_dir} {guest_home_dir} && "
-                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
-                f"--no-mount tmp,bind-paths -H {guest_home_dir} --env TMPDIR={guest_scratch_dir} "
-                f"--mount type=bind,src={guest_scratch_dir},dst={guest_scratch_dir} "
-                f"{env_args}"
-                f"{mount_str} "
-                f" {params.container} bash {container_script_path}"
-                f"; _rc=$?"
-                f"; nohup timeout 30 rm -rf {guest_scratch_dir} {guest_home_dir} >/dev/null 2>&1 "
-                f"& exit $_rc"
-            )
-        else:
-            tmp_scratch_dir = params.persistent_dir / "tmp_scratch"
-            tmp_scratch_dir.mkdir(parents=True, exist_ok=True)
-            home_scratch_dir = params.persistent_dir / "home_scratch"
-            home_scratch_dir.mkdir(parents=True, exist_ok=True)
-            apptainer_cmd = (
-                f"{params.apptainer_binary} exec --contain --writable-tmpfs --cleanenv --pid "
-                f"--no-mount tmp,bind-paths -H {home_scratch_dir} "
-                f"--mount type=bind,src={tmp_scratch_dir},dst=/tmp_scratch --env TMPDIR=/tmp_scratch "
-                f"{env_args}"
-                f"{mount_str} "
-                f" {params.container} bash {container_script_path}"
-            )
+        # [CUSTOM-FAKEROOT 2026-11-25] `--fakeroot` (when apptainer_use_fakeroot is set) gives
+        # SWE-Gym/R2E-Gym/SWE-smith/SWE-rebench real root inside the container directly, so their
+        # root-owned task-repo paths are writable without the VM-sidecar's guest-local scratch/
+        # home dir (removed same date -- that existed only because writes made as root inside a
+        # separate VM guest don't propagate real ownership back through its 9p share to this,
+        # the host-created persistent_dir). Every row now uses this one scratch/home dir.
+        fakeroot_flag = "--fakeroot " if params.apptainer_use_fakeroot else ""
+        tmp_scratch_dir = params.persistent_dir / "tmp_scratch"
+        tmp_scratch_dir.mkdir(parents=True, exist_ok=True)
+        home_scratch_dir = params.persistent_dir / "home_scratch"
+        home_scratch_dir.mkdir(parents=True, exist_ok=True)
+        apptainer_cmd = (
+            f"{params.apptainer_binary} exec {fakeroot_flag}--contain --writable-tmpfs --cleanenv --pid "
+            f"--no-mount tmp,bind-paths -H {home_scratch_dir} "
+            f"--mount type=bind,src={tmp_scratch_dir},dst=/tmp_scratch --env TMPDIR=/tmp_scratch "
+            f"{env_args}"
+            f"{mount_str} "
+            f" {params.container} bash {container_script_path}"
+        )
         memory_limit_mb = params.apptainer_memory_limit_mb
         if memory_limit_mb is not None and memory_limit_mb > 0:
             memory_limit_kb = int(memory_limit_mb) * 1024

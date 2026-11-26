@@ -1444,6 +1444,74 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             result = wrapper._build_apptainer_command(params, cmd_args)
             assert "ulimit -v" in result
 
+    def test_fakeroot_off_by_default(self, monkeypatch) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            params = _make_instance_config(tmpdir)
+            params.persistent_dir.mkdir(parents=True, exist_ok=True)
+
+            oh_dir = Path(params.openhands_setup_dir) / "OpenHands"
+            for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+                (oh_dir / subdir).mkdir(parents=True, exist_ok=True)
+            (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True, exist_ok=True)
+
+            cmd_args = ExecuteContainerCommandArgs(
+                command="echo hello",
+                expected_file_pattern="/tmp/*.json",
+                mode="agent",
+                timeout=300,
+            )
+            result = wrapper._build_apptainer_command(params, cmd_args)
+            assert "--fakeroot" not in result
+
+    @pytest.mark.parametrize(
+        "dataset_name",
+        ["SWE-Gym", "R2E-Gym/R2E-Gym-Subset", "SWE-smith", "SWE-rebench", "SWE-rebench-V2"],
+    )
+    def test_fakeroot_on_for_every_root_owned_dataset(self, monkeypatch, dataset_name: str) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            params = _make_instance_config(
+                tmpdir,
+                apptainer_use_fakeroot=True,
+                problem_info={
+                    "problem_statement": "Fix",
+                    "instance_id": "owner__repo-1",
+                    "base_commit": "abc",
+                    "dataset_name": dataset_name,
+                    "split": "test",
+                    "instance_dict": "{}",
+                    "container_formatter": ["/containers/{instance_id}.sif"],
+                },
+            )
+            params.persistent_dir.mkdir(parents=True, exist_ok=True)
+
+            # SWE-rebench needs its eval_meta files present to build the command at all.
+            eval_meta_dir = params.persistent_dir / "eval_meta"
+            eval_meta_dir.mkdir(parents=True, exist_ok=True)
+            (eval_meta_dir / "expected_passed.json").write_text("[]")
+            (eval_meta_dir / "fail_to_pass.json").write_text("[]")
+            (eval_meta_dir / "pass_to_pass.json").write_text("[]")
+
+            oh_dir = Path(params.openhands_setup_dir) / "OpenHands"
+            for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+                (oh_dir / subdir).mkdir(parents=True, exist_ok=True)
+            (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True, exist_ok=True)
+
+            cmd_args = ExecuteContainerCommandArgs(
+                command="echo hello",
+                expected_file_pattern="/tmp/*.json",
+                mode="agent",
+                timeout=300,
+            )
+            result = wrapper._build_apptainer_command(params, cmd_args)
+            assert "apptainer exec --fakeroot --contain" in result
+            # No VM-sidecar guest scratch dir should ever appear -- every row uses the single
+            # host-persistent_dir-based scratch/home dir now, fakeroot or not.
+            assert "/var/tmp/swe_agents_scratch" not in result
+            assert str(params.persistent_dir / "tmp_scratch") in result
+            assert str(params.persistent_dir / "home_scratch") in result
+
     def test_nv_internal_eval_mounts(self, monkeypatch) -> None:
         wrapper = _create_wrapper(monkeypatch)
         with tempfile.TemporaryDirectory() as tmpdir:
