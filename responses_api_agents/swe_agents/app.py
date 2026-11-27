@@ -1405,7 +1405,7 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
                 )
                 if result.returncode == 0:
                     print(f"OpenHands already set up at {setup_dir}", flush=True)
-                    self._require_image_ready("OpenHands", setup_dir / "openhands.img")
+                    self._require_openhands_images_ready(setup_dir)
                     return setup_dir
 
                 print(
@@ -1454,8 +1454,16 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
             # stale (built, if at all, from the PREVIOUS venv content) -- see
             # BaseDatasetHarnessProcessor._require_image_ready's own docstring for why that
             # rebuild is no longer done inline.
-            self._require_image_ready("OpenHands", setup_dir / "openhands.img")
+            self._require_openhands_images_ready(setup_dir)
             return setup_dir
+
+    def _require_openhands_images_ready(self, setup_dir: Path) -> None:
+        # [CUSTOM-VM-SIDECAR-BLOCKDEV-MORE 2026-11-20] Besides .venv, the base interpreter
+        # (miniforge3) and the openhands package are block devices too -- see
+        # scripts/prepare-env/vm/build_dir_image.sh in the outer repo for why.
+        self._require_image_ready("OpenHands", setup_dir / "openhands.img")
+        self._require_image_ready("OpenHands miniforge3", setup_dir / "miniforge3.img")
+        self._require_image_ready("OpenHands package", setup_dir / "openhands_pkg.img")
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         data_point = self.config.problem_info
@@ -1716,15 +1724,46 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
     return report_file
 
 
+def read_metrics_dict(metrics_fpath: Path) -> Dict[str, Any]:
+    """Read nemo_gym_metrics.json, tolerating the corruption concurrent writers leave behind.
+
+    [CUSTOM-TOLERANT-NG-METRICS 2026-11-21] Inside the agent container, OpenHands' runtime
+    (total_command_exec_time) and NemoGymClient (total_model_call_time) both did an unlocked
+    read-modify-write with open("w") on this file: two interleaved writes leave a valid JSON
+    object followed by the tail of the longer one (job 64971699: `JSONDecodeError: Extra
+    data: line 1 column 186`), and json.loads then failed the whole /run with a 500. Keep the
+    first JSON object instead (the lost keys are profiling timings, never the reward); an
+    unreadable file counts as empty.
+    """
+    text = metrics_fpath.read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    stripped = text.lstrip()
+    try:
+        obj, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        print(f"WARNING: {metrics_fpath} is not valid JSON, treating it as empty: {text[:200]!r}", flush=True)
+        return {}
+    print(
+        f"WARNING: {metrics_fpath} has {len(stripped) - end} bytes after its first JSON object "
+        "(interleaved concurrent writes), keeping the first object",
+        flush=True,
+    )
+    return obj if isinstance(obj, dict) else {}
+
+
 def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any]) -> None:
-    with metrics_fpath.open() as f:
-        existing_dict = json.loads(f.read())
+    existing_dict = read_metrics_dict(metrics_fpath)
 
     existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
     update_dict = {k: v for k, v in update_dict.items() if v is not None}
 
-    with metrics_fpath.open("w") as f:
-        json.dump(existing_dict | update_dict, f)
+    # [CUSTOM-TOLERANT-NG-METRICS] Atomic replace, so no reader ever sees a half-written file.
+    tmp_fpath = metrics_fpath.with_name(f".{metrics_fpath.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp_fpath.write_text(json.dumps(existing_dict | update_dict))
+    os.replace(tmp_fpath, metrics_fpath)
 
 
 # _TOOL_PARAM_BOOL_FIELDS_DEFAULT_FALSE = ("defer_loading",)
@@ -1835,6 +1874,15 @@ class RunOpenHandsAgent(BaseModel):
             r2e_gym_image = f"{self.config.r2e_gym_setup_dir}/r2e_gym.img"
             swesmith_dir = f"{self.config.swesmith_setup_dir}/SWE-smith"
             swesmith_image = f"{self.config.swesmith_setup_dir}/swesmith.img"
+            # [CUSTOM-VM-SIDECAR-BLOCKDEV-MORE 2026-11-20] OpenHands' base interpreter (stdlib +
+            # poetry, miniforge3) and the openhands package are imaged too: with only .venv off
+            # 9p, every OpenHands process still imported those over 9p and stalled for minutes
+            # at 24 rollouts per VM. Both are bind-mounted read-only into the containers and have
+            # no writable subdirectory (logs/, evaluation/oh/, .eval_sessions/ are siblings of
+            # openhands/, not under it). Appended last, so the existing drives keep vdc..vdf.
+            miniforge3_dir = f"{self.config.openhands_setup_dir}/miniforge3"
+            miniforge3_image = f"{self.config.openhands_setup_dir}/miniforge3.img"
+            openhands_pkg_image = f"{self.config.openhands_setup_dir}/openhands_pkg.img"
             vm_info = ensure_vm(
                 golden_image_dir=self.config.vm_golden_image_dir,
                 lustre_share_roots=self.config.vm_lustre_share_roots,
@@ -1843,6 +1891,8 @@ class RunOpenHandsAgent(BaseModel):
                     (swebench_image, f"{swebench_dir}/venv"),
                     (r2e_gym_image, f"{r2e_gym_dir}/venv"),
                     (swesmith_image, f"{swesmith_dir}/venv"),
+                    (miniforge3_image, miniforge3_dir),
+                    (openhands_pkg_image, f"{openhands_dir}/openhands"),
                 ],
             )
             process = await run_in_vm(vm_info, apptainer_cmd, env=proxy_env, stdout=log_file, stderr=log_file)
@@ -2941,7 +2991,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         #    or blew the context window) — the reward is accidental.
         # 2) Final eval step timed out — reward is unreliable.
         # 3) Agent itself timed out (wall-clock) — mask regardless of resolved.
-        persisted_metrics = SWEBenchMetrics.model_validate_json(params.metrics_fpath.read_text())
+        persisted_metrics = SWEBenchMetrics.model_validate(read_metrics_dict(params.metrics_fpath))
         resolved_now = metrics_to_update.get("resolved", False)
         agent_error_kind = persisted_metrics.agent_error_kind
         eval_timed_out = bool(persisted_metrics.eval_timed_out)
@@ -2979,7 +3029,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             tools=tools,
             metadata={
                 "input": json.dumps([i.model_dump() for i in input_items]),
-                "metrics": params.metrics_fpath.read_text(),
+                "metrics": json.dumps(read_metrics_dict(params.metrics_fpath)),
                 "instance_config": params.model_dump_json(),
             },
         )
