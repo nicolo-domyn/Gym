@@ -22,8 +22,12 @@ runs a FastAPI server inside the container to handle command execution.
 import asyncio
 import asyncio.subprocess
 import fcntl
+import hashlib
+import json
 import os
+import pwd
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -36,10 +40,61 @@ from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
 
+# [CUSTOM] SHA-256 of the task test runners that _harden_verifier_tests may edit: the
+# datagen-flash universal runner (Nemotron-Terminal-Synthetic-Tasks), shared by every task
+# of the agentic mix. Any other test.sh runs unchanged.
+_KNOWN_TEST_RUNNERS_SHA256 = frozenset({"d5f0f385ea3becba62eae7b657c827effb6b9466cc7534880b07f7d7253c4962"})
+_PYTEST_INVOCATION = b"python3 -m pytest"
+_PYTEST_INVOCATION_SAFE_PATH = b"python3 -P -m pytest"
+# [CUSTOM] Written by SingularityEnvironment.stop() into the trial dir, read by harbor_agent/app.py.
+ENVIRONMENT_METRICS_FILENAME = "environment_metrics.json"
+
+
 class MemoryLimitExceededError(Exception):
     """Raised when a container exceeds its memory limit."""
 
     pass
+
+
+def _process_tree(root_pid: int) -> set[int]:
+    """PIDs of root_pid and all its descendants, walking /proc/<pid>/task/*/children."""
+    pids: set[int] = set()
+    to_visit = [root_pid]
+    while to_visit:
+        current = to_visit.pop()
+        if current in pids:
+            continue
+        pids.add(current)
+        try:
+            for tid_dir in Path(f"/proc/{current}/task").iterdir():
+                try:
+                    to_visit.extend(int(c) for c in (tid_dir / "children").read_text().split() if c.isdigit())
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return pids
+
+
+def _process_memory(pid: int) -> int:
+    """Memory of one process in bytes: PSS if available, else RSS, else 0."""
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(Path(f"/proc/{pid}/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _process_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return "?"
 
 
 class SingularityEnvironment(BaseEnvironment):
@@ -66,6 +121,13 @@ class SingularityEnvironment(BaseEnvironment):
             will fail -- see docs/infrastructure/engineering-notes/ (harbor section) for 
             the concrete consequence found in a real task's tests/test.sh and the 
             mitigation.
+        singularity_scratch_dir: [CUSTOM] Host directory under which each container gets
+            its own fresh scratch directory (default: the system temp dir, i.e. $TMPDIR or
+            /tmp). The container's /tmp and $HOME live there instead of in the
+            --writable-tmpfs overlay, which is capped at 64 MiB ("sessiondir max size") and
+            was filled by the verifier's `pip install` of test dependencies (ENOSPC). The
+            directory is new for every container and removed in stop(), so nothing is
+            shared between trials, and the host $HOME is never touched.
         workdir: Container working directory override.
     """
 
@@ -80,11 +142,13 @@ class SingularityEnvironment(BaseEnvironment):
         singularity_force_pull: bool = False,
         singularity_no_mount: str | None = None,
         singularity_fakeroot: bool = True,
+        singularity_scratch_dir: Path | str | None = None,
         workdir: str | None = None,
         *args,
         **kwargs,
     ):
         self._fakeroot = singularity_fakeroot
+        self._scratch_base = str(singularity_scratch_dir) if singularity_scratch_dir else None
         if singularity_image_cache_dir:
             self._image_cache_dir = Path(singularity_image_cache_dir)
         else:
@@ -107,6 +171,7 @@ class SingularityEnvironment(BaseEnvironment):
         self._server_process: asyncio.subprocess.Process | None = None
         self._server_port: int | None = None
         self._staging_dir: Path | None = None
+        self._scratch_dir: Path | None = None
         self._sif_path: Path | None = None
         self._stream_task: asyncio.Task | None = None
         self._memory_watchdog_task: asyncio.Task | None = None
@@ -114,6 +179,12 @@ class SingularityEnvironment(BaseEnvironment):
 
         self._memory_limit_bytes = self.task_env_config.memory_mb * 1024 * 1024
         self._memory_limit_exceeded: str | None = None
+        # [CUSTOM] Processes that existed when the server became ready (Singularity runtime
+        # parent, sinit, bootstrap/_hbexec server, anything setup.sh left running). The
+        # memory watchdog never picks them as OOM victims.
+        self._protected_pids: set[int] = set()
+        # [CUSTOM] Processes the memory watchdog killed (pid, cmdline, MB), for logs/metrics.
+        self._memory_kills: list[tuple[int, str, int]] = []
 
         self._workdir = self._resolve_workdir()
 
@@ -370,6 +441,15 @@ class SingularityEnvironment(BaseEnvironment):
                     part = part.strip()
                     if part:
                         no_mount_args.extend(["--no-mount", part])
+            # [CUSTOM] Fresh host-side scratch for /tmp and $HOME (see singularity_scratch_dir in
+            # the class docstring). Recreated on every attempt so a retry never sees what a
+            # failed attempt wrote. Inside the container $HOME is the user's passwd home
+            # (/root under --fakeroot); --scratch puts an empty directory over that path, the
+            # host home itself is never mounted.
+            self._remove_scratch_dir()
+            self._scratch_dir = Path(tempfile.mkdtemp(prefix="singularity_scratch_", dir=self._scratch_base))
+            container_home = "/root" if self._fakeroot else pwd.getpwuid(os.getuid()).pw_dir
+            scratch_args = ["-W", str(self._scratch_dir), "--scratch", "/tmp", "--scratch", container_home]
             # Use exec + wrapper so /app exists before runtime chdir to image WORKDIR (R2E-Gym has no /app)
             bootstrap_cmd = [
                 "bash",
@@ -393,6 +473,7 @@ class SingularityEnvironment(BaseEnvironment):
                 *(["--fakeroot"] if self._fakeroot else []),
                 "--containall",
                 "--pid",
+                *scratch_args,
                 *bind_mounts,
                 str(self._sif_path),
                 *bootstrap_cmd,
@@ -443,6 +524,7 @@ class SingularityEnvironment(BaseEnvironment):
                             break  # Will trigger retry with new port
                         self.logger.info("Singularity FastAPI server is ready")
                         # Start memory watchdog now that server is ready
+                        self._protected_pids = _process_tree(self._server_process.pid)
                         self._memory_watchdog_task = asyncio.create_task(self._memory_watchdog())
                         server_ready = True
                         break
@@ -475,6 +557,12 @@ class SingularityEnvironment(BaseEnvironment):
             f"Failed to start Singularity FastAPI server after {max_port_retries} port attempts"
         )
 
+    def _remove_scratch_dir(self) -> None:
+        """[CUSTOM] Delete this container's scratch directory (its /tmp and $HOME)."""
+        if self._scratch_dir is not None:
+            shutil.rmtree(self._scratch_dir, ignore_errors=True)
+            self._scratch_dir = None
+
     async def _stream_server_output(self) -> None:
         """Stream server stdout/stderr to logger in real-time."""
         if not self._server_process or not self._server_process.stdout:
@@ -490,86 +578,64 @@ class SingularityEnvironment(BaseEnvironment):
             self.logger.debug(f"Server output stream ended: {e}")
 
     def _get_process_tree_memory(self, pid: int) -> int:
-        """Get total PSS memory of a process and all its descendants.
-
-        Uses PSS (Proportional Set Size) which properly accounts for shared memory
-        by dividing it proportionally among sharing processes. Falls back to RSS
-        if PSS is unavailable. Directly reads /proc for efficiency (no subprocess).
-        Returns memory in bytes, or 0 if unable to read.
-
-        Note: /proc reads are essentially instantaneous (kernel memory, not disk)
-        so this doesn't need to be async.
-        """
-
-        def get_all_descendants(root_pid: int) -> set[int]:
-            """Get all PIDs in the process tree by walking /proc children."""
-            pids = set()
-            to_visit = [root_pid]
-
-            while to_visit:
-                current = to_visit.pop()
-                if current in pids:
-                    continue
-                pids.add(current)
-
-                # Find children via /proc/[pid]/task/*/children
-                try:
-                    task_dir = Path(f"/proc/{current}/task")
-                    for tid_dir in task_dir.iterdir():
-                        children_file = tid_dir / "children"
-                        try:
-                            for child in children_file.read_text().split():
-                                if child.isdigit():
-                                    to_visit.append(int(child))
-                        except (OSError, PermissionError):
-                            pass
-                except (OSError, PermissionError):
-                    pass
-
-            return pids
-
-        def get_process_memory(p: int) -> int:
-            """Get memory for a single process: PSS if available, else RSS."""
-            # Try PSS from smaps_rollup (Linux 4.14+, more accurate)
-            try:
-                for line in Path(f"/proc/{p}/smaps_rollup").read_text().splitlines():
-                    if line.startswith("Pss:"):
-                        return int(line.split()[1]) * 1024
-            except (OSError, PermissionError, ValueError, IndexError):
-                pass
-
-            # Fallback to RSS from statm (second field, in pages)
-            try:
-                rss_pages = int(Path(f"/proc/{p}/statm").read_text().split()[1])
-                return rss_pages * os.sysconf("SC_PAGE_SIZE")
-            except (OSError, PermissionError, ValueError, IndexError):
-                pass
-
-            return 0
-
+        """Total PSS (RSS fallback) of a process and all its descendants, in bytes; 0 on error."""
         try:
-            return sum(get_process_memory(p) for p in get_all_descendants(pid))
+            return sum(_process_memory(p) for p in _process_tree(pid))
         except Exception:
             return 0
 
+    def _kill_largest_processes(self, excess_bytes: int) -> tuple[list[tuple[int, str, int]], int]:
+        """[CUSTOM] OOM-killer semantics: SIGKILL the largest unprotected processes until excess_bytes are freed.
+
+        Mirrors what the kernel does in a Docker cgroup at the task's memory limit (harbor's
+        Docker environment sets deploy.resources.limits.memory): processes die largest first,
+        the container, the exec server and the agent's tmux session survive, and the agent
+        sees "Killed" in its terminal instead of losing the whole trial.
+
+        Returns:
+            (pid, cmdline, MB) of each killed process, and the bytes they held.
+        """
+        candidates = sorted(
+            ((_process_memory(p), p) for p in _process_tree(self._server_process.pid) - self._protected_pids),
+            reverse=True,
+        )
+        killed, freed = [], 0
+        for mem, pid in candidates:
+            if freed >= excess_bytes or mem == 0:
+                break
+            cmdline = _process_cmdline(pid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                continue
+            killed.append((pid, cmdline, mem // 1024 // 1024))
+            freed += mem
+        return killed, freed
+
     async def _memory_watchdog(self) -> None:
-        """Monitor memory usage and kill container if it exceeds the limit.
+        """Monitor memory usage and enforce the task's memory limit.
 
         This runs as a background task while the container is active.
         Features:
-        - Adaptive intervals: checks every 1s when memory >50%, every 3s otherwise
+        - Checks every 1s ([CUSTOM] was 3s below 50% usage)
         - Explosion detection: warns if memory growth rate would hit limit in <5s
         - Kill threshold at 95%: leaves headroom before actual OOM
+        - [CUSTOM] Over the threshold, kills the largest unprotected processes (see
+          _kill_largest_processes), as the kernel OOM killer does in harbor's Docker
+          environment; kills the whole container only when that cannot bring usage under
+          the threshold, or after max_kill_rounds rounds in one trial
         """
         # Configuration
-        base_interval = 3  # seconds - normal check interval
+        base_interval = 1  # seconds - normal check interval ([CUSTOM] was 3: a fast hog overshot the limit 3x)
         fast_interval = 1  # seconds - when memory is high
         warning_threshold = 0.5  # Switch to fast mode at 50%
         kill_threshold = 0.95  # Kill at 95% to leave headroom
+        max_kill_rounds = 50  # process-kill rounds per trial before killing the container
 
         # State tracking
         last_mem_usage = 0
         last_check_time = 0.0
+        kill_rounds = 0
 
         self.logger.debug(
             f"Memory watchdog started: limit={self._memory_limit_bytes // 1024 // 1024}MB, "
@@ -609,12 +675,31 @@ class SingularityEnvironment(BaseEnvironment):
                 last_mem_usage = mem_usage
                 last_check_time = current_time
 
-                # Kill if exceeded threshold (95% to leave some headroom)
-                if mem_usage > self._memory_limit_bytes * kill_threshold:
+                # Over the threshold (95% to leave some headroom): kill the largest processes
+                # until back under it, as the kernel OOM killer would. Kill the whole container
+                # only when that is impossible (the protected processes alone are over the
+                # limit, or nothing could be killed) or after max_kill_rounds rounds.
+                threshold_bytes = self._memory_limit_bytes * kill_threshold
+                if mem_usage > threshold_bytes:
+                    victims, freed = [], 0
+                    if kill_rounds < max_kill_rounds:
+                        victims, freed = self._kill_largest_processes(int(mem_usage - threshold_bytes))
+                    self._memory_kills.extend(victims)
+                    if victims and mem_usage - freed <= threshold_bytes:
+                        kill_rounds += 1
+                        self.logger.warning(
+                            f"Memory limit exceeded: {mem_mb:.0f}MB > {limit_mb * kill_threshold:.0f}MB "
+                            f"({usage_pct * 100:.0f}%). Killed {len(victims)} process(es), largest first: "
+                            + "; ".join(f"pid {pid} {mb}MB {cmd[:100]}" for pid, cmd, mb in victims)
+                        )
+                        last_mem_usage = 0  # the next reading is after the kill: no growth rate
+                        await asyncio.sleep(fast_interval)
+                        continue
                     error_msg = f"Container exceeded memory limit ({mem_mb:.0f}MB > {limit_mb * kill_threshold:.0f}MB)"
                     self.logger.error(
-                        f"Memory limit exceeded: {mem_mb:.0f}MB > {limit_mb * kill_threshold:.0f}MB ({usage_pct * 100:.0f}%). "
-                        f"Killing container to prevent OOM."
+                        f"Memory limit exceeded: {mem_mb:.0f}MB > {limit_mb * kill_threshold:.0f}MB ({usage_pct * 100:.0f}%); "
+                        f"killing processes cannot bring it under the limit (round {kill_rounds}, "
+                        f"{len(victims)} killed). Killing container to prevent OOM."
                     )
                     # Set flag BEFORE killing so exec() can check it
                     self._memory_limit_exceeded = error_msg
@@ -701,6 +786,17 @@ class SingularityEnvironment(BaseEnvironment):
         # Cleanup staging directory
         if self._staging_dir and self._staging_dir.exists():
             shutil.rmtree(self._staging_dir, ignore_errors=True)
+        self._remove_scratch_dir()
+
+        # [CUSTOM] Per-trial environment metrics for harbor_agent/app.py. Written here because
+        # harbor calls stop() after the verifier, so kills in both phases count, and into the
+        # trial dir itself, which is not mounted in the container (the agent cannot edit it).
+        try:
+            (self.trial_paths.trial_dir / ENVIRONMENT_METRICS_FILENAME).write_text(
+                json.dumps({"memory_process_kills": len(self._memory_kills)})
+            )
+        except OSError as e:
+            self.logger.warning(f"Could not write {ENVIRONMENT_METRICS_FILENAME}: {e}")
 
         # Note: We don't delete .sif files as they can be reused
         if delete:
@@ -796,6 +892,11 @@ class SingularityEnvironment(BaseEnvironment):
             shutil.rmtree(staging_subdir)
         shutil.copytree(source, staging_subdir)
 
+        # [CUSTOM] Harbor's Verifier uploads the task tests to /tests right before running
+        # tests/test.sh, in the same container the agent used: see _prepare_verifier_upload.
+        if target_dir.rstrip("/") == str(EnvironmentPaths.tests_dir):
+            await self._prepare_verifier_upload(staging_subdir)
+
         # Create target directory and copy
         await self.exec(f"mkdir -p {target_dir}")
         result = await self.exec(f"cp -r /staging/{source.name}/* {target_dir}/")
@@ -805,6 +906,47 @@ class SingularityEnvironment(BaseEnvironment):
             if result.return_code != 0:
                 error_output = result.stderr or result.stdout or "<no output>"
                 raise RuntimeError(f"Failed to upload directory: {error_output}")
+
+    async def _prepare_verifier_upload(self, staged_tests: Path) -> None:
+        """[CUSTOM] Keep files the agent wrote from deciding the verifier's result.
+
+        The agent can write anywhere the verifier later reads: / is writable in the
+        overlay (so it can create /tests, e.g. a conftest.py that pytest would load), /app
+        is the cwd of test.sh (so `python3 -m pytest` puts it first on sys.path, and an
+        agent's inspect.py or pytest.py replaces the real module), and /logs/verifier is a
+        host directory (a reward file left there counts if test.sh exits before writing
+        its own). Before the tests are copied in:
+        - remove /tests, which the task images do not ship;
+        - remove reward and report files from the verifier directory;
+        - run pytest with -P (no cwd on sys.path) via _harden_verifier_tests.
+        Tests that import the agent's code add /app to sys.path themselves, and processes
+        they start still inherit the cwd /app.
+        """
+        result = await self.exec(f"rm -rf {EnvironmentPaths.tests_dir}")
+        if result.return_code != 0:
+            self.logger.warning(f"Could not clear {EnvironmentPaths.tests_dir} before verification")
+        for path in (
+            self.trial_paths.reward_text_path,
+            self.trial_paths.reward_json_path,
+            self.trial_paths.verifier_dir / "ctrf.json",
+        ):
+            path.unlink(missing_ok=True)
+        self._harden_verifier_tests(staged_tests)
+
+    def _harden_verifier_tests(self, staged_tests: Path) -> None:
+        """[CUSTOM] Make the staged copy of a known test.sh run `python3 -P -m pytest`.
+
+        Only a test.sh whose SHA-256 is in _KNOWN_TEST_RUNNERS_SHA256 is edited; any other
+        runs unchanged, with a warning. The task store is never modified.
+        """
+        test_sh = staged_tests / "test.sh"
+        if not test_sh.exists():
+            return
+        content = test_sh.read_bytes()
+        if hashlib.sha256(content).hexdigest() not in _KNOWN_TEST_RUNNERS_SHA256:
+            self.logger.warning(f"{test_sh.name} is not a known test runner: running it unchanged (no -P)")
+            return
+        test_sh.write_bytes(content.replace(_PYTEST_INVOCATION, _PYTEST_INVOCATION_SAFE_PATH, 1))
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         """Download a file from the container via staging directory."""
