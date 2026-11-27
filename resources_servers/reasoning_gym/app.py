@@ -18,14 +18,14 @@ import logging
 import re
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 import reasoning_gym
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from nemo_skills.mcp.tool_manager import ToolManager
-from pydantic import Field
-from reasoning_gym.utils import extract_answer
+from pydantic import Field, model_validator
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -37,6 +37,16 @@ from nemo_gym.sandbox_launcher import ensure_sandbox
 from nemo_gym.server_utils import SESSION_ID_KEY
 
 logger = logging.getLogger(__name__)
+
+# [CUSTOM-REASONING-GYM-SCORING 2026-11-27] Answer extraction and normalization helpers, see
+# ReasoningGymResourcesServer.verify() for how they combine.
+# Last <answer>...</answer> whose body contains no other "<answer>", so a literal mention of the
+# tag earlier in the text ("I'll wrap it in <answer> tags: <answer>3</answer>") can't swallow it.
+_ANSWER_TAG_RE = re.compile(r"<answer>((?:(?!<answer>).)*?)</answer>", re.DOTALL)
+# Plain decimal numeral without leading zeros, so "0101" (a bit string) never parses as 101.
+_PLAIN_DECIMAL_RE = re.compile(r"[+-]?(?:0|[1-9]\d*)(?:\.\d+)?")
+_APPROX_PREFIX_RE = re.compile(r"^(?:≈|~|\\approx)\s*")
+_EXACT_SCORE = 1.0 - 1e-9
 
 
 class ReasoningGymResourcesServerConfig(BaseResourcesServerConfig):
@@ -76,12 +86,39 @@ class ReasoningGymResourcesServerConfig(BaseResourcesServerConfig):
     # (3) With the upstream no longer single-threaded, proxy_max_concurrency=16 is safe.
     sandbox_proxy_port: Optional[int] = 6001
     sandbox_proxy_max_concurrency: int = 16
+    # [CUSTOM-REASONING-GYM-TIMEOUT 2026-11-27] How long the proxy waits for the sandbox (and for
+    # a free slot). Must exceed every tool's exec_timeout_s: at or below it the proxy cuts off a
+    # still-running execution and, since ReadTimeout is in its retry list, re-runs it from scratch.
+    sandbox_proxy_request_timeout_s: float = 150.0
 
     # Verbose logging for tool execution timing (disabled by default)
     verbose_tool_logging: bool = False
 
     # When True, skip replaying session history after sandbox worker restarts.
     disable_session_restore: bool = False
+
+    # [CUSTOM-REASONING-GYM-SCORING 2026-11-27] Agentic rollout audit (items #16/#32).
+    # Only the last <answer> tag of the final assistant message is graded. Without a tag, a bare
+    # final message or its last \boxed{} still counts, but only for full credit (many questions say
+    # "respond with only your answer", which contradicts the system prompt's <answer> requirement).
+    # True disables that fallback: no tag, no reward.
+    strict_answer_tag: bool = False
+    # reasoning_gym scorers hand out 0.01-0.05 for any (even unparseable) answer; rewards below
+    # this are set to 0 so GRPO doesn't reward format alone. 0 disables it.
+    min_reward: float = 0.06
+
+    @model_validator(mode="after")
+    def _check_proxy_timeout(self) -> "ReasoningGymResourcesServerConfig":
+        if not (self.sandbox_sif_path and self.sandbox_proxy_port):
+            return self
+        for tool_name, overrides in self.nemo_skills_tool_overrides.items():
+            exec_timeout_s = overrides.get("exec_timeout_s")
+            if exec_timeout_s is not None and exec_timeout_s >= self.sandbox_proxy_request_timeout_s:
+                raise ValueError(
+                    f"{tool_name}.exec_timeout_s={exec_timeout_s} must be below "
+                    f"sandbox_proxy_request_timeout_s={self.sandbox_proxy_request_timeout_s}"
+                )
+        return self
 
 
 class ReasoningGymVerifyRequest(BaseVerifyRequest):
@@ -126,6 +163,7 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
                     network="none",
                     proxy_port=self.config.sandbox_proxy_port,
                     proxy_max_concurrency=self.config.sandbox_proxy_max_concurrency,
+                    proxy_request_timeout_s=self.config.sandbox_proxy_request_timeout_s,
                 )
                 # [CUSTOM-REASONING-GYM-SANDBOX-PROXY 2026-10-23] see sandbox_proxy_port's own
                 # comment above -- this server's own tool calls (_initialize_nemo_skills_tools
@@ -328,8 +366,6 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
                 f"internal_timeouts={metrics['tool_timeout_count']}, request_timeouts={metrics['tool_request_timeout_count']}"
             )
 
-        model_answer = self._extract_answer_from_response(body.response)
-
         task_name = body.metadata.get("source_dataset")
 
         if not task_name:
@@ -340,53 +376,109 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
             "answer": body.answer,
             "metadata": body.metadata,
         }
-        try:
-            score_fn = reasoning_gym.get_score_answer_fn(task_name)
-            score = float(score_fn(answer=model_answer, entry=entry))
-        except Exception as e:
-            print(f"Error scoring answer for task {task_name}: {e}")
-            score = 0.0
+
+        # [CUSTOM-REASONING-GYM-SCORING 2026-11-27] Previously all assistant messages were
+        # concatenated and, with no <answer> tag (31% of audited rollouts), the whole text was
+        # graded: the default scorer's substring credit plus the 0.01-0.05 floor many scorers give
+        # to any answer rewarded format, not solving. Now only the final message counts, the
+        # untagged fallback earns full credit or nothing, and floor credit is zeroed.
+        final_text = self._final_message_text(body.response)
+        model_answer = self._extract_tagged_answer(final_text)
+        score = 0.0
+        if model_answer is not None:
+            model_answer = self._normalize_answer(model_answer, body.answer)
+            score = self._score(task_name, model_answer, entry)
+        elif final_text and not self.config.strict_answer_tag:
+            for candidate in (final_text.strip(), self._last_boxed(final_text)):
+                if not candidate:
+                    continue
+                candidate = self._normalize_answer(candidate, body.answer)
+                candidate_score = self._score(task_name, candidate, entry)
+                if candidate_score >= _EXACT_SCORE:
+                    model_answer, score = candidate, candidate_score
+                    break
+
+        reward = score if score >= self.config.min_reward else 0.0
 
         return ReasoningGymVerifyResponse(
             **body.model_dump(),
-            reward=score,
+            reward=reward,
             task_name=task_name,
             score=score,
             extracted_answer=model_answer,
             **metrics,
         )
 
-    def _extract_answer_from_response(self, response) -> str:
-        assistant_responses = []
-        for output_item in response.output:
+    @staticmethod
+    def _score(task_name: str, answer: str, entry: Dict[str, Any]) -> float:
+        try:
+            score_fn = reasoning_gym.get_score_answer_fn(task_name)
+            return float(score_fn(answer=answer, entry=entry))
+        except Exception as e:
+            logger.warning(f"Error scoring answer for task {task_name}: {e}")
+            return 0.0
+
+    @staticmethod
+    def _final_message_text(response) -> Optional[str]:
+        """Text of the assistant message that ends the rollout.
+
+        None when the rollout ended on a tool call or tool output (step cap, truncation): an
+        answer written before further tool use is not the model's final answer.
+        """
+        for output_item in reversed(response.output):
+            if output_item.type in ("function_call", "function_call_output"):
+                return None
             if output_item.type != "message":
                 continue
-
             if isinstance(output_item.content, str):
-                assistant_responses.append(output_item.content)
-            else:
-                for content_item in output_item.content:
-                    if content_item.type != "output_text":
-                        continue
-                    assistant_responses.append(content_item.text)
+                return output_item.content
+            return "".join(c.text for c in output_item.content if c.type == "output_text")
+        return None
 
-        full_text = "".join(assistant_responses)
+    @staticmethod
+    def _extract_tagged_answer(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        matches = _ANSWER_TAG_RE.findall(text)
+        return matches[-1].strip() if matches else None
 
-        # Try <answer> tags first (reasoning gym default)
-        extracted = extract_answer(full_text, tag_name="answer")
-        if extracted is not None:
-            return extracted
+    @staticmethod
+    def _last_boxed(text: str) -> Optional[str]:
+        """Content of the last \\boxed{...}, with balanced braces (e.g. \\boxed{\\frac{1}{2}})."""
+        start = text.rfind("\\boxed{")
+        if start < 0:
+            return None
+        depth = 0
+        for i in range(start + len("\\boxed"), len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start + len("\\boxed{") : i].strip()
+        return None
 
-        # Try \boxed{} if <answer> tags fail
-        # this could be a slight instruction following issue, if model is prompted to use <answer> but uses boxed instead
-        # found for deepseek-distill-qwen-1.5b it fails to use <answer> tags in favor of boxed, hence this fallback
-        # may advise commenting this out for large models who follow instructions to use <answer> well
-        boxed_match = re.search(r"\\boxed\{([^}]+)\}", full_text)
-        if boxed_match:
-            return boxed_match.group(1).strip()
+    @staticmethod
+    def _normalize_answer(answer: str, oracle: Optional[str]) -> str:
+        """Fix formatting differences the reasoning_gym scorers grade as wrong.
 
-        # return full text if <answer> or \boxed{} fail
-        return full_text.strip() if full_text.strip() else ""
+        - a leading "≈"/"~"/"\\approx" (coin_flip's Fraction() parse rejects it -> 0);
+        - a decimal numeral exactly equal to a decimal oracle ("83.0" vs "83": simple_geometry's
+          default substring scorer gives 0.5) is replaced by the oracle string.
+        """
+        if not isinstance(oracle, str):
+            return answer
+        oracle = oracle.strip()
+        stripped = _APPROX_PREFIX_RE.sub("", answer)
+        if stripped != answer and not _APPROX_PREFIX_RE.match(oracle):
+            answer = stripped
+        if _PLAIN_DECIMAL_RE.fullmatch(answer) and _PLAIN_DECIMAL_RE.fullmatch(oracle):
+            try:
+                if Decimal(answer) == Decimal(oracle):
+                    return oracle
+            except InvalidOperation:
+                pass
+        return answer
 
     async def shutdown(self):
         """Cleanup resources on server shutdown."""

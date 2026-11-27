@@ -35,6 +35,11 @@ from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNo
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
 
+# [CUSTOM] Same name as singularity.py's ENVIRONMENT_METRICS_FILENAME; not imported, since that
+# module imports harbor at load time and this one imports harbor lazily.
+ENVIRONMENT_METRICS_FILENAME = "environment_metrics.json"
+
+
 class HarborDatasetSourceConfig(BaseModel):
     local_dataset_path: Optional[str] = None
     dataset_name: Optional[str] = None
@@ -289,6 +294,14 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     with open(agent_error_flags_path, "r") as f:
                         agent_error_flags = json.load(f)
 
+                # [CUSTOM] Environment metrics written by SingularityEnvironment.stop() (absent with
+                # other environments): processes the memory watchdog killed, agent and verifier.
+                environment_metrics = {}
+                environment_metrics_path = trial_dir / ENVIRONMENT_METRICS_FILENAME
+                if environment_metrics_path.exists():
+                    with open(environment_metrics_path, "r") as f:
+                        environment_metrics = json.load(f)
+
                 # Extract reward from verifier result
                 verifier_result = trial_result.get("verifier_result")
                 reward = HarborAgentUtils.extract_reward(verifier_result)
@@ -308,6 +321,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 trial_result = None
                 trajectory = None
                 agent_error_flags = {}
+                environment_metrics = {}
                 output_items = []
                 input_messages = []
                 usage = None
@@ -334,6 +348,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 metadata=trial_result if trial_result else {},
                 context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
                 memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
+                memory_process_kills=int(environment_metrics.get("memory_process_kills", 0)),
                 agent_timeout_error=int(
                     ((trial_result or {}).get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
                 ),
