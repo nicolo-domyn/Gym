@@ -19,8 +19,10 @@ import pytest
 import reasoning_gym
 
 from nemo_gym.openai_utils import (
+    NeMoGymFunctionCallOutput,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseFunctionToolCall,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
@@ -212,3 +214,197 @@ class TestApp:
 
         assert json.loads(response.body)["process_status"] == "timeout"
         assert server._timing_by_session["timeout-session"][0]["is_internal_timeout"] is True
+
+
+def _message(text: str, msg_id: str = "msg") -> NeMoGymResponseOutputMessage:
+    return NeMoGymResponseOutputMessage(
+        id=msg_id, content=[NeMoGymResponseOutputText(text=text, annotations=[])]
+    )
+
+
+def _tool_call(call_id: str = "call_1") -> NeMoGymResponseFunctionToolCall:
+    return NeMoGymResponseFunctionToolCall(
+        arguments='{"code": "print(1)"}', call_id=call_id, name="stateful_python_code_exec"
+    )
+
+
+def _tool_output(call_id: str = "call_1") -> NeMoGymFunctionCallOutput:
+    return NeMoGymFunctionCallOutput(call_id=call_id, output='{"process_status": "completed", "stdout": "1"}')
+
+
+class TestScoring:
+    """[CUSTOM-REASONING-GYM-SCORING 2026-11-27] agentic rollout audit items #16 and #32."""
+
+    def _server(self, **config_kwargs) -> ReasoningGymResourcesServer:
+        config = ReasoningGymResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name="", **config_kwargs)
+        return ReasoningGymResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    async def _verify(self, server, task_name: str, output: list, entry: dict | None = None, seed: int = 42):
+        if entry is None:
+            entry = reasoning_gym.create_dataset(task_name, size=1, seed=seed)[0]
+        response = NeMoGymResponse(
+            id="resp", created_at=0.0, model="m", object="response", output=output,
+            parallel_tool_calls=False, tool_choice="auto", tools=[],
+        )
+        request = ReasoningGymVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+                input=[{"role": "user", "content": entry["question"]}]
+            ),
+            response=response,
+            question=entry["question"],
+            answer=entry["answer"],
+            metadata=entry["metadata"],
+        )
+        return await server.verify(None, request), entry
+
+    def _entry(self, task_name: str, seed: int = 42) -> dict:
+        return reasoning_gym.create_dataset(task_name, size=1, seed=seed)[0]
+
+    @pytest.mark.asyncio
+    async def test_tagged_answer_in_final_message(self) -> None:
+        entry = self._entry("leg_counting")
+        output = [_tool_call(), _tool_output(), _message(f"Counting legs... <answer>{entry['answer']}</answer>")]
+        result, _ = await self._verify(self._server(), "leg_counting", output, entry)
+        assert result.reward == 1.0
+        assert result.extracted_answer == entry["answer"]
+
+    @pytest.mark.asyncio
+    async def test_last_tag_wins_and_literal_tag_mention_ignored(self) -> None:
+        entry = self._entry("leg_counting")
+        text = f"I'll wrap it in <answer> tags. Draft <answer>999</answer>, final <answer>{entry['answer']}</answer>"
+        result, _ = await self._verify(self._server(), "leg_counting", [_message(text)], entry)
+        assert result.extracted_answer == entry["answer"]
+        assert result.reward == 1.0
+
+    @pytest.mark.asyncio
+    async def test_answer_before_more_tool_use_is_not_final(self) -> None:
+        """A tagged answer followed by more tool calls (rollout cut by the step cap) scores 0."""
+        entry = self._entry("leg_counting")
+        output = [_message(f"<answer>{entry['answer']}</answer>"), _tool_call(), _tool_output()]
+        result, _ = await self._verify(self._server(), "leg_counting", output, entry)
+        assert result.reward == 0.0
+        assert result.extracted_answer is None
+
+    @pytest.mark.asyncio
+    async def test_earlier_message_tag_not_used(self) -> None:
+        entry = self._entry("leg_counting")
+        output = [
+            _message(f"Maybe <answer>{entry['answer']}</answer>", msg_id="m1"),
+            _tool_call(),
+            _tool_output(),
+            _message("I am not sure anymore.", msg_id="m2"),
+        ]
+        result, _ = await self._verify(self._server(), "leg_counting", output, entry)
+        assert result.reward == 0.0
+
+    @pytest.mark.asyncio
+    async def test_bare_exact_answer_gets_full_credit(self) -> None:
+        """Questions often say "respond with only your answer": a bare exact answer still counts."""
+        entry = self._entry("leg_counting")
+        result, _ = await self._verify(self._server(), "leg_counting", [_message(f"\n\n{entry['answer']}")], entry)
+        assert result.reward == 1.0
+
+    @pytest.mark.asyncio
+    async def test_bare_answer_rejected_in_strict_mode(self) -> None:
+        entry = self._entry("leg_counting")
+        server = self._server(strict_answer_tag=True)
+        result, _ = await self._verify(server, "leg_counting", [_message(entry["answer"])], entry)
+        assert result.reward == 0.0
+
+    @pytest.mark.asyncio
+    async def test_untagged_long_text_gets_no_substring_credit(self) -> None:
+        """Old behaviour: whole text graded, default scorer gave len(oracle)/len(text) > 0."""
+        entry = self._entry("leg_counting")
+        text = f"After counting every animal carefully, the total number of legs is {entry['answer']}."
+        result, _ = await self._verify(self._server(), "leg_counting", [_message(text)], entry)
+        assert result.reward == 0.0
+
+    @pytest.mark.asyncio
+    async def test_untagged_last_balanced_boxed(self) -> None:
+        entry = self._entry("leg_counting")
+        text = f"First guess \\boxed{{1}}. Final: \\boxed{{{entry['answer']}}}"
+        result, _ = await self._verify(self._server(), "leg_counting", [_message(text)], entry)
+        assert result.reward == 1.0
+
+    def test_last_boxed_handles_nested_braces(self) -> None:
+        assert ReasoningGymResourcesServer._last_boxed("x \\boxed{a} y \\boxed{\\frac{1}{2}} z") == "\\frac{1}{2}"
+        assert ReasoningGymResourcesServer._last_boxed("\\boxed{unclosed") is None
+        assert ReasoningGymResourcesServer._last_boxed("no box") is None
+
+    @pytest.mark.asyncio
+    async def test_floor_credit_zeroed(self) -> None:
+        """puzzle24 gives 0.01 to any answer, even garbage: reward must be 0, score keeps the raw value."""
+        result, _ = await self._verify(self._server(), "puzzle24", [_message("<answer>banana</answer>")])
+        assert result.score == pytest.approx(0.01)
+        assert result.reward == 0.0
+
+    @pytest.mark.asyncio
+    async def test_floor_threshold_can_be_disabled(self) -> None:
+        result, _ = await self._verify(self._server(min_reward=0.0), "puzzle24", [_message("<answer>banana</answer>")])
+        assert result.reward == pytest.approx(0.01)
+
+    @pytest.mark.asyncio
+    async def test_no_final_message_scores_zero(self) -> None:
+        result, _ = await self._verify(self._server(), "puzzle24", [_tool_call(), _tool_output()])
+        assert result.reward == 0.0
+        assert result.extracted_answer is None
+
+    @pytest.mark.asyncio
+    async def test_simple_geometry_trailing_zero(self) -> None:
+        entry = self._entry("simple_geometry", seed=1)
+        assert "." not in entry["answer"]
+        result, _ = await self._verify(
+            self._server(), "simple_geometry", [_message(f"<answer>{entry['answer']}.0</answer>")], entry
+        )
+        assert result.reward == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", ["≈", "≈ ", "~", "\\approx "])
+    async def test_coin_flip_approx_prefix(self, prefix: str) -> None:
+        entry = self._entry("coin_flip", seed=1)
+        result, _ = await self._verify(
+            self._server(), "coin_flip", [_message(f"<answer>{prefix}{entry['answer']}</answer>")], entry
+        )
+        assert result.reward == 1.0
+
+    @pytest.mark.parametrize(
+        "answer,oracle,expected",
+        [
+            ("83.0", "83", "83"),
+            ("-4.50", "-4.5", "-4.5"),
+            ("0101", "101", "0101"),  # bit strings / zero-padded values are not numbers
+            ("83.1", "83", "83.1"),
+            ("≈0.25", "0.25", "0.25"),
+            ("~x", "~x", "~x"),  # oracle itself starts with the prefix: leave it alone
+            ("A", None, "A"),
+        ],
+    )
+    def test_normalize_answer(self, answer, oracle, expected) -> None:
+        assert ReasoningGymResourcesServer._normalize_answer(answer, oracle) == expected
+
+
+class TestProxyTimeoutConfig:
+    """[CUSTOM-REASONING-GYM-TIMEOUT 2026-11-27]"""
+
+    def _config(self, exec_timeout_s, **kwargs) -> ReasoningGymResourcesServerConfig:
+        return ReasoningGymResourcesServerConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            nemo_skills_tools=["nemo_skills.mcp.servers.python_tool::DirectPythonTool"],
+            nemo_skills_tool_overrides={"DirectPythonTool": {"exec_timeout_s": exec_timeout_s}},
+            **kwargs,
+        )
+
+    def test_exec_timeout_at_or_above_proxy_timeout_rejected(self) -> None:
+        with pytest.raises(ValueError, match="sandbox_proxy_request_timeout_s"):
+            self._config(150, sandbox_sif_path="/x.sif", sandbox_proxy_request_timeout_s=150)
+
+    def test_exec_timeout_below_proxy_timeout_accepted(self) -> None:
+        config = self._config(120, sandbox_sif_path="/x.sif")
+        assert config.sandbox_proxy_request_timeout_s > 120
+
+    def test_check_skipped_without_launched_sandbox(self) -> None:
+        """No sif path -> no proxy is started by this server, so nothing to check."""
+        self._config(500)

@@ -14,7 +14,11 @@ reasoning_gym:
       # Per-tool configuration overrides
       nemo_skills_tool_overrides:
         DirectPythonTool:
-          exec_timeout_s: 10
+          # [CUSTOM-REASONING-GYM-TIMEOUT 2026-11-27] The training prompt and tool description
+          # (finer-flows, copied from NeMo-Skills' python_tool.py) promise 120 s; at 10 s the
+          # agentic audit counted 47 timeouts and 35 session resets. Must stay below
+          # sandbox_proxy_request_timeout_s (checked at startup).
+          exec_timeout_s: 120
 
       # Sandbox configuration. Independently configurable from ns_tools's own
       # sandbox_host/sandbox_port env vars -- this resources server must work standalone
@@ -42,6 +46,12 @@ reasoning_gym:
       # max_concurrency set to 16 (the library default).
       sandbox_proxy_port: 6001
       sandbox_proxy_max_concurrency: 16
+      # Must exceed exec_timeout_s above, or the proxy cuts off (and retries) running code.
+      sandbox_proxy_request_timeout_s: 150
+
+      # [CUSTOM-REASONING-GYM-SCORING 2026-11-27] see ReasoningGymResourcesServerConfig in app.py.
+      strict_answer_tag: false
+      min_reward: 0.06
 
       # Disable session replay after sandbox worker restarts (improves stability)
       disable_session_restore: true
