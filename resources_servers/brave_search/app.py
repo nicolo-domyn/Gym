@@ -15,17 +15,23 @@ docs/infrastructure/engineering-notes/aiohttp-vs-httpx.md. google_search's use o
 `requests` for the same reason is a precedent for this kind of low-volume exception.
 """
 
+import asyncio
 import importlib.util
+import io
+import ipaddress
 import logging
+import multiprocessing
 import os
-import re
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import httpx
+import pypdf
 import trafilatura
 from fastapi import FastAPI
 from mcp import ClientSession
@@ -50,6 +56,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+# pypdf logs a warning per malformed object, which floods the server log on real-world PDFs.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 def _load_rate_limiter_class() -> type:
@@ -116,6 +124,29 @@ class BraveSearchResourcesServerConfig(BaseResourcesServerConfig):
     max_results: int = 10
     debug: bool = False
 
+    # [CUSTOM-BROWSE-FIXES 2026-11-27] User-Agent sent by browse(). httpx's default
+    # ("python-httpx/...") gets a 403 from Wikipedia and most forums; a spoofed desktop-browser
+    # string gets a 429 from Wikipedia instead (Wikimedia's UA policy). The "compatible" crawler
+    # form was the one that worked on the most audited URLs (probe of 453 URLs from the
+    # 2026-11-26 agentic rollout audit).
+    browse_user_agent: str = "Mozilla/5.0 (compatible; NeMoGymBrowse/1.0; +https://github.com/NVIDIA-NeMo/Gym)"
+    # Retried once with this User-Agent when browse_user_agent gets one of these statuses: some
+    # sites (Britannica, newscientist, mathworks) only serve desktop browsers. None disables it.
+    browse_fallback_user_agent: Optional[str] = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+    browse_fallback_statuses: List[int] = Field(default_factory=lambda: [403, 406, 429])
+    browse_timeout_sec: float = 10.0
+    # Text extraction (pypdf, trafilatura) is CPU-bound pure Python: it runs in a pool of
+    # processes, so that concurrent PDFs neither serialize on the GIL nor stall the event loop.
+    # Measured on 16 large PDFs at once: 68 s and a 1 s event-loop stall with threads, 11 s and
+    # 61 ms with 8 processes.
+    browse_extract_workers: int = 8
+    browse_extract_timeout_sec: float = 30.0
+    # Only the first pages of a PDF are extracted, to bound pypdf's CPU time. On the audit's PDFs,
+    # 20 pages instead of 50 saved only ~23% of it and dropped content from 6% of the PDF calls.
+    browse_max_pdf_pages: int = 50
+
     # Optional distributed rate limiter for Brave's own API rate limit, backed by a shared
     # Redis instance (see nemo_rl/utils/redis_job.py in the outer repo, which submits it as a
     # SLURM job and exports its host into NEMO_RL_REDIS_HOST). Disabled by default -- every
@@ -181,27 +212,117 @@ class BraveSearchVerifyResponse(BaseVerifyResponse):
     delegated_response: Optional[Dict[str, Any]] = None
 
 
-def box_parser(output_str: str) -> Optional[str]:
-    if not isinstance(output_str, str):
-        output_str = str(output_str)
+_BOXED = "\\boxed"
+# LaTeX wrappers a model puts around an option letter, e.g. \boxed{\text{C}}.
+_OPTION_WRAPPERS = ("\\textbf", "\\text", "\\mathrm", "\\mathbf", "\\rm ", "\\bf ")
 
+
+def box_parser(output_str: Optional[str]) -> Optional[str]:
+    """Content of the last \\boxed{...} in output_str, matching nested braces, or None.
+
+    [CUSTOM-BOX-PARSER 2026-11-27] Was a non-greedy regex on the first box: it ignored a revised
+    answer in a later box, and cut \\boxed{\\text{C}} at the first closing brace.
+    """
     if output_str is None:
         return None
-    try:
-        match = re.search(r"\\boxed\{(.*?)\}", output_str)
-        parsed_option = match.group(1) if match else None
-        return parsed_option
-    except Exception as e:
-        print(f"Regex error: {e}")
+    if not isinstance(output_str, str):
+        output_str = str(output_str)
+    start = output_str.rfind(_BOXED)
+    while start != -1:
+        i = start + len(_BOXED)
+        while i < len(output_str) and output_str[i].isspace():
+            i += 1
+        if i < len(output_str) and output_str[i] == "{":
+            depth = 0
+            for j in range(i, len(output_str)):
+                if output_str[j] == "{":
+                    depth += 1
+                elif output_str[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return output_str[i + 1 : j]
+        start = output_str.rfind(_BOXED, 0, start)
+    return None
+
+
+def _normalize_option(option: Optional[str]) -> Optional[str]:
+    """Strips whitespace and LaTeX wrappers around a boxed option: "{\\text{ C }}" -> "C"."""
+    if option is None:
         return None
+    while True:
+        stripped = option.strip()
+        for wrapper in _OPTION_WRAPPERS:
+            if stripped.startswith(wrapper):
+                stripped = stripped[len(wrapper) :].strip()
+                break
+        if stripped.startswith("{") and stripped.endswith("}"):
+            stripped = stripped[1:-1]
+        if stripped == option:
+            return option
+        option = stripped
 
 
 def _extract_last_assistant_text(body: BraveSearchVerifyRequest) -> Optional[str]:
     last_message = body.response.output[-1]
-    if last_message.type == "message" and last_message.role == "assistant":
-        return last_message.content
-    else:
+    if last_message.type != "message" or last_message.role != "assistant":
         return None
+    # [CUSTOM-BOX-PARSER 2026-11-27] content is a list of output_text parts. It used to be
+    # returned as is, and box_parser ran on its str(), where backslashes are doubled.
+    content = last_message.content
+    if isinstance(content, str):
+        return content
+    return "".join(getattr(part, "text", None) or "" for part in content)
+
+
+class _BlockedURLError(Exception):
+    """browse() refused a URL: non-HTTP scheme, or a host that is not a public internet address."""
+
+
+async def _check_public_url(url: httpx.URL) -> None:
+    """Raises _BlockedURLError unless url is http(s) and its host resolves only to public addresses.
+
+    [CUSTOM-BROWSE-FIXES 2026-11-27] browse() used to fetch any URL, so the model could reach
+    services on the node or the cluster network (e.g. http://localhost:8000 in the 2026-11-26
+    audit). NO_PROXY exempts localhost and 10.0.0.0/8 from the proxy, so such requests are not
+    even filtered by it. Called for every request, redirects included (event hook below).
+    """
+    if url.scheme not in ("http", "https"):
+        raise _BlockedURLError(f"unsupported URL scheme {url.scheme!r}")
+    host = url.host
+    if not host:
+        raise _BlockedURLError("URL has no host")
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, url.port or 443)
+        except OSError as e:
+            raise _BlockedURLError(f"could not resolve host {host!r}") from e
+        addresses = [ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos]
+    for address in addresses:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if not address.is_global:
+            raise _BlockedURLError(f"host {host!r} is not a public internet address")
+
+
+def _extract_page_text(
+    content: bytes, content_type: str, encoding: Optional[str], max_pdf_pages: int
+) -> Optional[str]:
+    """Text of a fetched page: trafilatura for HTML, pypdf for PDF, as is for plain text.
+
+    Runs in a worker process of BraveSearchResourcesServer's extraction pool, so it takes the
+    response's parts rather than the httpx.Response.
+    """
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+    content_type = content_type.lower()
+    if "application/pdf" in content_type or content[:5] == b"%PDF-":
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        return "\n".join(page.extract_text() or "" for page in reader.pages[:max_pdf_pages]).strip() or None
+    text = content.decode(encoding or "utf-8", errors="replace")
+    if content_type.startswith(("text/plain", "text/markdown")):
+        return text.strip() or None
+    return trafilatura.extract(text)
 
 
 class BraveSearchResourcesServer(SimpleResourcesServer):
@@ -211,6 +332,21 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
     _mcp_session: Optional[ClientSession] = None
     _mcp_process: Optional[subprocess.Popen] = None
     _rate_limiter: Optional["RateLimiter"] = None
+    _extract_pool: Optional[ProcessPoolExecutor] = None
+
+    def _get_extract_pool(self) -> ProcessPoolExecutor:
+        if self._extract_pool is None:
+            # forkserver, not fork: this process runs uvicorn, the MCP client and other threads.
+            self._extract_pool = ProcessPoolExecutor(
+                max_workers=self.config.browse_extract_workers,
+                mp_context=multiprocessing.get_context("forkserver"),
+            )
+        return self._extract_pool
+
+    def _shutdown_extract_pool(self) -> None:
+        if self._extract_pool is not None:
+            self._extract_pool.shutdown(wait=False, cancel_futures=True)
+            self._extract_pool = None
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -246,6 +382,7 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
             finally:
                 await self._close_mcp_session()
                 self._stop_local_mcp_server()
+                self._shutdown_extract_pool()
 
         app.router.lifespan_context = lifespan_wrapper
 
@@ -425,20 +562,63 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
         # at most a few times per rollout turn, not at the 16k-concurrent-request scale that
         # mandate is about). trafilatura is still used for the network-free HTML-to-text
         # extraction step below, which is the part actually worth keeping it for.
+        #
+        # [CUSTOM-BROWSE-FIXES 2026-11-27] 70% of browse calls failed in the 2026-11-26 audit:
+        # httpx's default User-Agent got 403s (Wikipedia: 370/370), PDFs and text/plain pages
+        # came back as "No text found", and non-200 answers as an uninformative "No HTML found".
+        # Now: a crawler User-Agent (browser one as fallback), PDF and plain-text extraction in a
+        # process pool, the HTTP status in the error, and no requests to loopback/private
+        # addresses (see _check_public_url).
+        async def check_request(request: httpx.Request) -> None:
+            await _check_public_url(request.url)
+
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=self.config.browse_timeout_sec,
+                headers={"User-Agent": self.config.browse_user_agent},
+                event_hooks={"request": [check_request]},
+            ) as client:
                 response = await client.get(body.url)
-            html = response.text if response.status_code == 200 else None
-            if html:
-                text = trafilatura.extract(html)
-                if text and len(text.split()) > 10000:
-                    text = text[:5000] + "..." + text[-5000:]
-                if text:
-                    return BaseGetPageContentResponse(page_content=text)
-                else:
-                    return BaseGetPageContentResponse(page_content="No text found")
-            else:
-                return BaseGetPageContentResponse(page_content="No HTML found")
+                fallback_ua = self.config.browse_fallback_user_agent
+                if fallback_ua and response.status_code in self.config.browse_fallback_statuses:
+                    response = await client.get(body.url, headers={"User-Agent": fallback_ua})
+            if not response.is_success:
+                return BaseGetPageContentResponse(
+                    page_content=f"Error: HTTP {response.status_code} {response.reason_phrase}"
+                )
+            try:
+                text = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        self._get_extract_pool(),
+                        _extract_page_text,
+                        response.content,
+                        response.headers.get("content-type", ""),
+                        response.encoding,
+                        self.config.browse_max_pdf_pages,
+                    ),
+                    timeout=self.config.browse_extract_timeout_sec,
+                )
+            except TimeoutError:
+                # The worker keeps going until it is done (bounded by browse_max_pdf_pages).
+                logger.warning(f"brave_search.browse() text extraction timed out for url={body.url!r}")
+                return BaseGetPageContentResponse(page_content="Error: could not extract the page text in time")
+            except BrokenProcessPool:
+                # A worker died (e.g. killed for memory): the pool rejects all work from now on.
+                logger.error(f"brave_search.browse() extraction pool broke on url={body.url!r}; recreating it")
+                self._shutdown_extract_pool()
+                return BaseGetPageContentResponse(page_content="Error: could not extract the page text")
+            if not text:
+                return BaseGetPageContentResponse(page_content="No text found")
+            if len(text.split()) > 10000:
+                text = text[:5000] + "..." + text[-5000:]
+            return BaseGetPageContentResponse(page_content=text)
+        except _BlockedURLError as e:
+            return BaseGetPageContentResponse(page_content=f"Error: URL not allowed: {e}")
+        except httpx.TimeoutException:
+            return BaseGetPageContentResponse(
+                page_content=f"Error: timed out after {self.config.browse_timeout_sec:g}s"
+            )
         except Exception as e:
             # [ADDED 2026-11-04] See the matching comment in search() -- trafilatura.fetch_url
             # is a genuine internet-bound call (through the proxy when enabled), so a failure
@@ -459,7 +639,7 @@ class BraveSearchResourcesServer(SimpleResourcesServer):
         if verifier_type == self.config.default_verifier:
             expected_answer = body.expected_answer
             response_text = _extract_last_assistant_text(body)
-            parsed_option = box_parser(response_text)
+            parsed_option = _normalize_option(box_parser(response_text))
             reward = 1.0 if parsed_option == expected_answer else 0.0
             return BraveSearchVerifyResponse(**body.model_dump(), reward=reward, parsed_option=parsed_option)
 

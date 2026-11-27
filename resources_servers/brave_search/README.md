@@ -31,13 +31,19 @@ with Qwen3-32B so samples are not easily answerable without external search assi
 ### Environment Tools
 - **search**: Calls the Brave MCP server's `brave_web_search` tool and returns up to
   `max_results` (default 10) results.
-- **browse**: Identical to `google_search`'s `browse()` -- fetches a URL and extracts cleaned
-  text via `trafilatura`. Brave's MCP server has no page-fetch tool of its own, and
-  page-cleaning is orthogonal to which search backend produced the URL.
+- **browse**: Fetches a URL (with `browse_user_agent`, retried once with
+  `browse_fallback_user_agent` on a `browse_fallback_statuses` answer; through the proxy when
+  enabled) and extracts its text: `trafilatura` for HTML, `pypdf` for PDFs (first
+  `browse_max_pdf_pages` pages), plain-text responses as they are. Extraction runs in a pool of
+  `browse_extract_workers` processes, with a `browse_extract_timeout_sec` limit. Non-2xx answers
+  come back as `Error: HTTP <status>`. URLs whose host is not a public internet address
+  (localhost, private and link-local ranges), including redirect targets, are refused. Brave's MCP
+  server has no page-fetch tool of its own.
 
 ### Verifier
-Same as `google_search`: extracts the boxed MCQ option (`\boxed{X}`) from the last assistant
-message and checks it against `expected_answer`.
+Extracts the MCQ option from the last balanced `\boxed{...}` of the last assistant message,
+strips LaTeX wrappers (`\text{C}`, `{\rm C}`, extra braces), and checks it against
+`expected_answer`.
 
 ## Requirements
 
